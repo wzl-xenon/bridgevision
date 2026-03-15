@@ -1,0 +1,18 @@
+# data
+data/
+outputs/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# ide
+.vscode/
+.idea/
+
+# notebook
+.ipynb_checkpoints/
+
+# logs
+*.log
