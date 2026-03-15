@@ -1,8 +1,7 @@
-# run_train.py
-
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import torch
@@ -34,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ---------------------------
     # Model / 模型相关
     # ---------------------------
+    parser.add_argument("--model_mode", type=str, default="dual", choices=["dual", "resnet_only", "vit_only"])
     parser.add_argument("--num_classes", type=int, default=None)
     parser.add_argument("--resnet_name", type=str, default="resnet50")
     parser.add_argument("--vit_name", type=str, default="vit_b_16")
@@ -57,11 +57,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_val_batches", type=int, default=None)
 
     # ---------------------------
+    # Cache / 缓存相关
+    # ---------------------------
+    parser.add_argument("--torch_home", type=str, default="./pretrained/torch_home")
+
+    # ---------------------------
     # Save / 保存相关
     # ---------------------------
     parser.add_argument("--save_dir", type=str, default="./outputs/checkpoints/run_train")
 
     return parser
+
+
+def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
+    """
+    统计总参数量和可训练参数量
+    Count total and trainable parameters
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total_params, trainable_params
 
 
 def main() -> None:
@@ -70,6 +85,16 @@ def main() -> None:
     """
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.freeze_backbones and not args.pretrained_backbones:
+        raise ValueError(
+            "freeze_backbones=True requires pretrained_backbones=True. "
+            "Freezing randomly initialized backbones is not meaningful for stage-1 experiments."
+        )
+
+    torch_home = Path(args.torch_home).resolve()
+    torch_home.mkdir(parents=True, exist_ok=True)
+    os.environ["TORCH_HOME"] = str(torch_home)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -99,6 +124,7 @@ def main() -> None:
     # 2. Build model / 构建模型
     # ---------------------------
     model = DualEncoderModel(
+        model_mode=args.model_mode,
         num_classes=num_classes,
         resnet_name=args.resnet_name,
         vit_name=args.vit_name,
@@ -112,14 +138,71 @@ def main() -> None:
         dropout=args.dropout,
     )
 
+    total_params, trainable_params = count_parameters(model)
+    trainable_param_list = [p for p in model.parameters() if p.requires_grad]
+
+    if len(trainable_param_list) == 0:
+        raise ValueError("No trainable parameters found. Please check model / freeze settings.")
+
+    print("=" * 80)
+    print("Model summary / 模型摘要")
+    print(f"Model mode          : {args.model_mode}")
+    print(f"Dataset             : {args.dataset_name}")
+    print(f"Num classes         : {num_classes}")
+    print(f"Pretrained          : {args.pretrained_backbones}")
+    print(f"Freeze backbones    : {args.freeze_backbones}")
+    print(f"Fusion type         : {args.fusion_type}")
+    print(f"Projector type      : {args.projector_type}")
+    print(f"Fusion dim          : {args.fusion_dim}")
+    print(f"Total params        : {total_params:,}")
+    print(f"Trainable params    : {trainable_params:,}")
+    print(f"TORCH_HOME          : {torch_home}")
+    print("=" * 80)
+
     # ---------------------------
     # 3. Build optimizer / 构建优化器
+    # 只传可训练参数
     # ---------------------------
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_param_list,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+
+    checkpoint_meta = {
+        "model_config": {
+            "model_mode": args.model_mode,
+            "num_classes": num_classes,
+            "resnet_name": args.resnet_name,
+            "vit_name": args.vit_name,
+            "pretrained_backbones": args.pretrained_backbones,
+            "freeze_backbones": args.freeze_backbones,
+            "projector_type": args.projector_type,
+            "fusion_type": args.fusion_type,
+            "fusion_dim": args.fusion_dim,
+            "projector_hidden_dim": args.projector_hidden_dim,
+            "fusion_hidden_dim": args.fusion_hidden_dim,
+            "dropout": args.dropout,
+        },
+        "data_config": {
+            "dataset_name": args.dataset_name,
+            "image_size": args.image_size,
+            "split_seed": args.split_seed,
+            "pet_train_ratio": args.pet_train_ratio,
+            "num_classes": num_classes,
+        },
+        "train_config": {
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "use_amp": args.use_amp,
+            "max_train_batches": args.max_train_batches,
+            "max_val_batches": args.max_val_batches,
+            "save_dir": args.save_dir,
+            "torch_home": str(torch_home),
+        },
+    }
 
     # ---------------------------
     # 4. Build trainer / 构建训练器
@@ -132,6 +215,7 @@ def main() -> None:
         scheduler=None,
         use_amp=args.use_amp,
         save_dir=args.save_dir,
+        checkpoint_meta=checkpoint_meta,
     )
 
     # ---------------------------
