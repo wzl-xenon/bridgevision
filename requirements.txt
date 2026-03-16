@@ -1,0 +1,17 @@
+# 核心依赖
+torch>=1.12.0
+torchvision>=0.13.0
+tqdm>=4.64.0
+pillow>=9.0.0
+pyyaml>=6.0
+
+# 可选：日志与可视化（后续实现时需要）
+# tensorboard>=2.12.0
+# wandb>=0.15.0
+# matplotlib>=3.7.0
+
+# 可选：测试与开发
+# pytest>=7.0.0
+# black>=23.0.0
+# isort>=5.12.0
+# flake8>=6.0.0
