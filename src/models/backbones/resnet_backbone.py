@@ -4,8 +4,21 @@ from __future__ import annotations
 
 from typing import Dict
 
+import os
+
+os.environ.setdefault("TORCHVISION_DISABLE_NMS_EXPORT", "1")
+
 import torch
 import torch.nn as nn
+
+# 为部分缺少 torchvision::nms 注册的环境提供兼容占位符
+# Provide a compatibility stub for environments missing torchvision::nms registration
+try:
+    lib = torch.library.Library("torchvision", "DEF")
+    lib.define("nms(Tensor dets, Tensor scores, float iou_threshold) -> Tensor")
+except Exception:
+    pass
+
 from torchvision import models
 
 

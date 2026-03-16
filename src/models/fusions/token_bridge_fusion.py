@@ -4,17 +4,69 @@ import torch
 import torch.nn as nn
 
 
+class FeedForwardBlock(nn.Module):
+    """
+    Transformer 风格前馈网络 / Transformer-style feed-forward network
+
+    作用 / Purpose:
+    1. 在 cross-attention 之后进一步做 token 级非线性变换
+       Apply token-wise nonlinear refinement after cross-attention
+    2. 保持输入输出维度一致
+       Keep input and output dimensions unchanged
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,
+        hidden_dim: int | None = None,
+        dropout: float = 0.1,
+        use_layernorm: bool = True,
+    ) -> None:
+        super().__init__()
+
+        hidden_dim = hidden_dim or feature_dim * 4
+
+        self.pre_norm = nn.LayerNorm(feature_dim) if use_layernorm else nn.Identity()
+        self.ffn = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, feature_dim),
+            nn.Dropout(dropout),
+        )
+        self.post_norm = nn.LayerNorm(feature_dim) if use_layernorm else nn.Identity()
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播 / Forward pass
+
+        Args:
+            tokens: [B, N, D]
+
+        Returns:
+            refined_tokens: [B, N, D]
+        """
+        residual = tokens
+        tokens = self.pre_norm(tokens)
+        tokens = self.ffn(tokens)
+        tokens = residual + tokens
+        tokens = self.post_norm(tokens)
+        return tokens
+
+
 class TokenBridgeFusion(nn.Module):
     """
-    双向 token-level bridge fusion / Bidirectional token-level bridge fusion
+    双向 token-level bridge fusion block / Bidirectional token-level bridge fusion block
 
-    结构 / Structure:
-    1. CNN <- ViT cross-attention
-       CNN tokens use ViT tokens as key/value
-    2. ViT <- CNN cross-attention
-       ViT tokens use CNN tokens as key/value
+    固定版结构 / Fixed structure:
+    1. CNN <- ViT 双向交叉注意力中的一个方向
+       CNN tokens query ViT tokens as key/value
+    2. ViT <- CNN 双向交叉注意力中的另一个方向
+       ViT tokens query CNN tokens as key/value
     3. 两边都做 gated residual update
        Apply gated residual update on both branches
+    4. 两边都接一个 FFN refinement
+       Apply one FFN refinement block on both branches
 
     输入 / Inputs:
     - cnn_tokens: [B, N_c, D]
@@ -31,6 +83,7 @@ class TokenBridgeFusion(nn.Module):
         num_heads: int = 8,
         dropout: float = 0.1,
         gate_hidden_dim: int | None = None,
+        ffn_hidden_dim: int | None = None,
         use_gate: bool = True,
         use_layernorm: bool = True,
     ) -> None:
@@ -90,10 +143,26 @@ class TokenBridgeFusion(nn.Module):
             self.vit_gate_mlp = None
 
         # ---------------------------
-        # Output norms / 输出归一化
+        # Post-attention norms / 注意力后的归一化
         # ---------------------------
         self.cnn_output_norm = nn.LayerNorm(feature_dim) if use_layernorm else nn.Identity()
         self.vit_output_norm = nn.LayerNorm(feature_dim) if use_layernorm else nn.Identity()
+
+        # ---------------------------
+        # FFN refinement / 前馈网络细化
+        # ---------------------------
+        self.cnn_ffn = FeedForwardBlock(
+            feature_dim=feature_dim,
+            hidden_dim=ffn_hidden_dim,
+            dropout=dropout,
+            use_layernorm=use_layernorm,
+        )
+        self.vit_ffn = FeedForwardBlock(
+            feature_dim=feature_dim,
+            hidden_dim=ffn_hidden_dim,
+            dropout=dropout,
+            use_layernorm=use_layernorm,
+        )
 
     def forward(
         self,
@@ -103,6 +172,8 @@ class TokenBridgeFusion(nn.Module):
         return_attn_weights: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
+        前向传播 / Forward pass
+
         Args:
             cnn_tokens: [B, N_c, D]
             vit_tokens: [B, N_v, D]
@@ -129,6 +200,12 @@ class TokenBridgeFusion(nn.Module):
                 f"but got {cnn_tokens.shape} and {vit_tokens.shape}."
             )
 
+        if cnn_tokens.shape[-1] != self.feature_dim or vit_tokens.shape[-1] != self.feature_dim:
+            raise ValueError(
+                f"Last dimension must match feature_dim={self.feature_dim}, "
+                f"but got {cnn_tokens.shape[-1]} and {vit_tokens.shape[-1]}."
+            )
+
         # ---------------------------
         # 1. CNN <- ViT
         # CNN tokens as query, ViT tokens as key/value
@@ -141,7 +218,7 @@ class TokenBridgeFusion(nn.Module):
             key=vit_kv_for_cnn,
             value=vit_kv_for_cnn,
             need_weights=return_attn_weights,
-        )  # [B, N_c, D]
+        )
 
         # ---------------------------
         # 2. ViT <- CNN
@@ -155,7 +232,7 @@ class TokenBridgeFusion(nn.Module):
             key=cnn_kv_for_vit,
             value=cnn_kv_for_vit,
             need_weights=return_attn_weights,
-        )  # [B, N_v, D]
+        )
 
         outputs: dict[str, torch.Tensor] = {}
 
@@ -168,11 +245,10 @@ class TokenBridgeFusion(nn.Module):
 
             cnn_gate = torch.sigmoid(
                 self.cnn_gate_mlp(torch.cat([cnn_tokens, cnn_cross], dim=-1))
-            )  # [B, N_c, D]
-
+            )
             vit_gate = torch.sigmoid(
                 self.vit_gate_mlp(torch.cat([vit_tokens, vit_cross], dim=-1))
-            )  # [B, N_v, D]
+            )
 
             fused_cnn_tokens = cnn_tokens + cnn_gate * cnn_cross
             fused_vit_tokens = vit_tokens + vit_gate * vit_cross
@@ -186,6 +262,12 @@ class TokenBridgeFusion(nn.Module):
 
         fused_cnn_tokens = self.cnn_output_norm(fused_cnn_tokens)
         fused_vit_tokens = self.vit_output_norm(fused_vit_tokens)
+
+        # ---------------------------
+        # 4. FFN refinement / FFN 细化
+        # ---------------------------
+        fused_cnn_tokens = self.cnn_ffn(fused_cnn_tokens)
+        fused_vit_tokens = self.vit_ffn(fused_vit_tokens)
 
         outputs["fused_cnn_tokens"] = fused_cnn_tokens
         outputs["fused_vit_tokens"] = fused_vit_tokens
@@ -201,14 +283,15 @@ def _demo_token_bridge_fusion() -> None:
     """
     简单测试 / Simple test
     """
-    cnn_tokens = torch.randn(2, 49, 256)
-    vit_tokens = torch.randn(2, 196, 256)
+    cnn_tokens = torch.randn(2, 50, 256)
+    vit_tokens = torch.randn(2, 197, 256)
 
     fusion = TokenBridgeFusion(
         feature_dim=256,
         num_heads=8,
         dropout=0.1,
         gate_hidden_dim=256,
+        ffn_hidden_dim=512,
         use_gate=True,
         use_layernorm=True,
     )

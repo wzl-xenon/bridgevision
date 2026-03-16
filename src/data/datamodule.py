@@ -1,5 +1,3 @@
-# src/data/datamodule.py
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,28 +8,49 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 
+DatasetName = Literal[
+    "oxfordiiitpet",
+    "flowers102",
+    "dtd",
+    "fgvc_aircraft",
+    "country211",
+    "food101",
+]
+
+
 class VisionDataModule:
     """
     Simple vision datamodule / 简单视觉数据模块
 
-    当前第一版支持 / Supported in version 1:
+    当前扩展版支持 / Supported in the expanded version:
     - Oxford-IIIT Pets
     - Flowers102
+    - DTD
+    - FGVC Aircraft
+    - Country211
+    - Food101
 
     设计目标 / Design goals:
-    1. 先把自然图像分类训练闭环跑通
-       Make the natural-image classification pipeline work first
-    2. 输入分辨率与当前 ResNet50 / ViT-B-16 baseline 保持一致
-       Keep input resolution consistent with current ResNet50 / ViT-B-16 baseline
-    3. 对没有官方 val split 的数据集，在代码里做稳定划分
-       For datasets without official val split, create a stable split in code
+    1. 统一对外暴露 train / val / test 三个 split
+       Always expose train / val / test splits externally
+    2. 优先使用官方 split；如果没有官方 val，则在代码中稳定划分
+       Prefer official splits; if official val is absent, create a deterministic split in code
+    3. 让不同数据集尽量复用同一套训练入口
+       Let different datasets share the same training entry as much as possible
     """
 
-    SUPPORTED_DATASETS = {"oxfordiiitpet", "flowers102"}
+    SUPPORTED_DATASETS = {
+        "oxfordiiitpet",
+        "flowers102",
+        "dtd",
+        "fgvc_aircraft",
+        "country211",
+        "food101",
+    }
 
     def __init__(
         self,
-        dataset_name: Literal["oxfordiiitpet", "flowers102"] = "oxfordiiitpet",
+        dataset_name: DatasetName = "oxfordiiitpet",
         data_root: str = "./data",
         image_size: int = 224,
         batch_size: int = 4,
@@ -41,6 +60,9 @@ class VisionDataModule:
         use_imagenet_norm: bool = True,
         split_seed: int = 42,
         pet_train_ratio: float = 0.9,
+        food101_train_ratio: float = 0.9,
+        dtd_partition: int = 1,
+        aircraft_annotation_level: Literal["variant", "family", "manufacturer"] = "variant",
     ) -> None:
         """
         Args:
@@ -53,8 +75,8 @@ class VisionDataModule:
                 Dataset root directory
 
             image_size:
-                模型输入尺寸，第一版建议 224
-                Model input size, 224 is recommended for v1
+                模型输入尺寸，当前建议 224
+                Model input size, 224 is currently recommended
 
             batch_size:
                 batch 大小
@@ -83,6 +105,19 @@ class VisionDataModule:
             pet_train_ratio:
                 Oxford-IIIT Pets 的 trainval 中用于训练集的比例
                 Ratio of train subset within Oxford-IIIT Pets trainval split
+
+            food101_train_ratio:
+                Food101 的官方 train split 中用于训练集的比例
+                Ratio of train subset within Food101 official train split
+
+            dtd_partition:
+                DTD 的官方 partition 编号，范围 1~10
+                Official DTD partition id, should be in [1, 10]
+
+            aircraft_annotation_level:
+                FGVC Aircraft 的标签粒度
+                Annotation granularity for FGVC Aircraft
+                - variant / family / manufacturer
         """
         dataset_name = dataset_name.lower()
         if dataset_name not in self.SUPPORTED_DATASETS:
@@ -94,6 +129,20 @@ class VisionDataModule:
         if not (0.0 < pet_train_ratio < 1.0):
             raise ValueError(f"pet_train_ratio must be in (0, 1), but got {pet_train_ratio}.")
 
+        if not (0.0 < food101_train_ratio < 1.0):
+            raise ValueError(
+                f"food101_train_ratio must be in (0, 1), but got {food101_train_ratio}."
+            )
+
+        if not (1 <= dtd_partition <= 10):
+            raise ValueError(f"dtd_partition must be in [1, 10], but got {dtd_partition}.")
+
+        if aircraft_annotation_level not in {"variant", "family", "manufacturer"}:
+            raise ValueError(
+                "aircraft_annotation_level must be one of "
+                "['variant', 'family', 'manufacturer']."
+            )
+
         self.dataset_name = dataset_name
         self.data_root = Path(data_root)
         self.image_size = image_size
@@ -103,18 +152,45 @@ class VisionDataModule:
         self.pin_memory = pin_memory
         self.use_imagenet_norm = use_imagenet_norm
         self.split_seed = split_seed
+
         self.pet_train_ratio = pet_train_ratio
+        self.food101_train_ratio = food101_train_ratio
+        self.dtd_partition = dtd_partition
+        self.aircraft_annotation_level = aircraft_annotation_level
 
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
 
+        self.num_classes = self._infer_num_classes()
+
+    def _infer_num_classes(self) -> int:
+        """
+        根据数据集配置推断类别数
+        Infer number of classes from dataset configuration
+        """
         if self.dataset_name == "oxfordiiitpet":
-            self.num_classes = 37
-        elif self.dataset_name == "flowers102":
-            self.num_classes = 102
-        else:
-            raise RuntimeError(f"Unexpected dataset_name={self.dataset_name}")
+            return 37
+        if self.dataset_name == "flowers102":
+            return 102
+        if self.dataset_name == "dtd":
+            return 47
+        if self.dataset_name == "fgvc_aircraft":
+            if self.aircraft_annotation_level == "variant":
+                return 100
+            if self.aircraft_annotation_level == "family":
+                return 70
+            if self.aircraft_annotation_level == "manufacturer":
+                return 30
+            raise RuntimeError(
+                f"Unexpected aircraft_annotation_level={self.aircraft_annotation_level}"
+            )
+        if self.dataset_name == "country211":
+            return 211
+        if self.dataset_name == "food101":
+            return 101
+
+        raise RuntimeError(f"Unexpected dataset_name={self.dataset_name}")
 
     def _build_normalize(self) -> transforms.Normalize:
         """
@@ -166,7 +242,11 @@ class VisionDataModule:
         )
         return eval_transform
 
-    def _build_split_indices(self, num_samples: int, train_ratio: float) -> tuple[list[int], list[int]]:
+    def _build_split_indices(
+        self,
+        num_samples: int,
+        train_ratio: float,
+    ) -> tuple[list[int], list[int]]:
         """
         根据固定随机种子生成 train/val 下标
         Build deterministic train/val indices with a fixed random seed
@@ -179,6 +259,29 @@ class VisionDataModule:
         val_indices = perm[num_train:]
 
         return train_indices, val_indices
+
+    def _build_split_from_two_copies(
+        self,
+        train_dataset_for_train_transform,
+        train_dataset_for_eval_transform,
+        train_ratio: float,
+    ) -> tuple[Subset, Subset]:
+        """
+        从同一个官方 train/trainval split 中切分 train / val
+        Split train / val from the same official train or trainval split
+
+        之所以需要两份 dataset，是为了让 train 和 val 用不同的 transform
+        We need two dataset copies so that train and val can use different transforms
+        """
+        train_indices, val_indices = self._build_split_indices(
+            num_samples=len(train_dataset_for_train_transform),
+            train_ratio=train_ratio,
+        )
+
+        train_subset = Subset(train_dataset_for_train_transform, train_indices)
+        val_subset = Subset(train_dataset_for_eval_transform, val_indices)
+
+        return train_subset, val_subset
 
     def _build_oxfordiiitpet(self) -> None:
         """
@@ -196,8 +299,6 @@ class VisionDataModule:
         train_transform = self.build_train_transform()
         eval_transform = self.build_eval_transform()
 
-        # 同一个官方 trainval split，分别构建 train-transform 和 eval-transform 版本
-        # Build two copies of official trainval split with different transforms
         base_trainval_for_train = datasets.OxfordIIITPet(
             root=str(self.data_root),
             split="trainval",
@@ -214,13 +315,11 @@ class VisionDataModule:
             download=self.download,
         )
 
-        train_indices, val_indices = self._build_split_indices(
-            num_samples=len(base_trainval_for_train),
+        self.train_dataset, self.val_dataset = self._build_split_from_two_copies(
+            train_dataset_for_train_transform=base_trainval_for_train,
+            train_dataset_for_eval_transform=base_trainval_for_eval,
             train_ratio=self.pet_train_ratio,
         )
-
-        self.train_dataset = Subset(base_trainval_for_train, train_indices)
-        self.val_dataset = Subset(base_trainval_for_eval, val_indices)
 
         self.test_dataset = datasets.OxfordIIITPet(
             root=str(self.data_root),
@@ -263,6 +362,160 @@ class VisionDataModule:
             download=self.download,
         )
 
+    def _build_dtd(self) -> None:
+        """
+        构建 DTD 数据集
+        Build DTD datasets
+
+        说明 / Notes:
+        - DTD 官方就有 train / val / test
+          DTD already has official train / val / test
+        - 支持 partition 1~10
+          Supports partition 1~10
+        """
+        train_transform = self.build_train_transform()
+        eval_transform = self.build_eval_transform()
+
+        self.train_dataset = datasets.DTD(
+            root=str(self.data_root),
+            split="train",
+            partition=self.dtd_partition,
+            transform=train_transform,
+            download=self.download,
+        )
+
+        self.val_dataset = datasets.DTD(
+            root=str(self.data_root),
+            split="val",
+            partition=self.dtd_partition,
+            transform=eval_transform,
+            download=self.download,
+        )
+
+        self.test_dataset = datasets.DTD(
+            root=str(self.data_root),
+            split="test",
+            partition=self.dtd_partition,
+            transform=eval_transform,
+            download=self.download,
+        )
+
+    def _build_fgvc_aircraft(self) -> None:
+        """
+        构建 FGVC Aircraft 数据集
+        Build FGVC Aircraft datasets
+
+        说明 / Notes:
+        - FGVC Aircraft 官方有 train / val / test
+          FGVC Aircraft already has official train / val / test
+        - annotation_level 支持 variant / family / manufacturer
+          annotation_level supports variant / family / manufacturer
+        """
+        train_transform = self.build_train_transform()
+        eval_transform = self.build_eval_transform()
+
+        self.train_dataset = datasets.FGVCAircraft(
+            root=str(self.data_root),
+            split="train",
+            annotation_level=self.aircraft_annotation_level,
+            transform=train_transform,
+            download=self.download,
+        )
+
+        self.val_dataset = datasets.FGVCAircraft(
+            root=str(self.data_root),
+            split="val",
+            annotation_level=self.aircraft_annotation_level,
+            transform=eval_transform,
+            download=self.download,
+        )
+
+        self.test_dataset = datasets.FGVCAircraft(
+            root=str(self.data_root),
+            split="test",
+            annotation_level=self.aircraft_annotation_level,
+            transform=eval_transform,
+            download=self.download,
+        )
+
+    def _build_country211(self) -> None:
+        """
+        构建 Country211 数据集
+        Build Country211 datasets
+
+        说明 / Notes:
+        - Country211 官方使用 train / valid / test
+          Country211 uses official train / valid / test
+        - 注意验证集名字是 valid，不是 val
+          Note that the validation split name is 'valid', not 'val'
+        """
+        train_transform = self.build_train_transform()
+        eval_transform = self.build_eval_transform()
+
+        self.train_dataset = datasets.Country211(
+            root=str(self.data_root),
+            split="train",
+            transform=train_transform,
+            download=self.download,
+        )
+
+        self.val_dataset = datasets.Country211(
+            root=str(self.data_root),
+            split="valid",
+            transform=eval_transform,
+            download=self.download,
+        )
+
+        self.test_dataset = datasets.Country211(
+            root=str(self.data_root),
+            split="test",
+            transform=eval_transform,
+            download=self.download,
+        )
+
+    def _build_food101(self) -> None:
+        """
+        构建 Food101 数据集
+        Build Food101 datasets
+
+        说明 / Notes:
+        - Food101 官方只有 train / test
+          Food101 officially only provides train / test
+        - 因此这里把 official train 稳定切成 train / val
+          Therefore we split official train into train / val deterministically
+        - official test 保持不动
+          The official test split is kept unchanged
+        """
+        train_transform = self.build_train_transform()
+        eval_transform = self.build_eval_transform()
+
+        base_train_for_train = datasets.Food101(
+            root=str(self.data_root),
+            split="train",
+            transform=train_transform,
+            download=self.download,
+        )
+
+        base_train_for_eval = datasets.Food101(
+            root=str(self.data_root),
+            split="train",
+            transform=eval_transform,
+            download=self.download,
+        )
+
+        self.train_dataset, self.val_dataset = self._build_split_from_two_copies(
+            train_dataset_for_train_transform=base_train_for_train,
+            train_dataset_for_eval_transform=base_train_for_eval,
+            train_ratio=self.food101_train_ratio,
+        )
+
+        self.test_dataset = datasets.Food101(
+            root=str(self.data_root),
+            split="test",
+            transform=eval_transform,
+            download=self.download,
+        )
+
     def setup(self) -> None:
         """
         构建数据集对象 / Build dataset objects
@@ -271,6 +524,14 @@ class VisionDataModule:
             self._build_oxfordiiitpet()
         elif self.dataset_name == "flowers102":
             self._build_flowers102()
+        elif self.dataset_name == "dtd":
+            self._build_dtd()
+        elif self.dataset_name == "fgvc_aircraft":
+            self._build_fgvc_aircraft()
+        elif self.dataset_name == "country211":
+            self._build_country211()
+        elif self.dataset_name == "food101":
+            self._build_food101()
         else:
             raise RuntimeError(f"Unexpected dataset_name={self.dataset_name}")
 
@@ -319,6 +580,21 @@ class VisionDataModule:
             pin_memory=self.pin_memory,
         )
 
+    def get_dataset_summary(self) -> dict[str, int | str]:
+        """
+        返回数据集摘要信息 / Return dataset summary information
+        """
+        if self.train_dataset is None or self.val_dataset is None or self.test_dataset is None:
+            raise RuntimeError("Datasets are not built yet. Please call setup() first.")
+
+        return {
+            "dataset_name": self.dataset_name,
+            "num_classes": self.num_classes,
+            "train_size": len(self.train_dataset),
+            "val_size": len(self.val_dataset),
+            "test_size": len(self.test_dataset),
+        }
+
 
 def _demo_datamodule(dataset_name: str = "oxfordiiitpet") -> None:
     """
@@ -337,8 +613,13 @@ def _demo_datamodule(dataset_name: str = "oxfordiiitpet") -> None:
         use_imagenet_norm=True,
         split_seed=42,
         pet_train_ratio=0.9,
+        food101_train_ratio=0.9,
+        dtd_partition=1,
+        aircraft_annotation_level="variant",
     )
     dm.setup()
+
+    summary = dm.get_dataset_summary()
 
     train_loader = dm.train_dataloader()
     val_loader = dm.val_dataloader()
@@ -350,10 +631,11 @@ def _demo_datamodule(dataset_name: str = "oxfordiiitpet") -> None:
 
     print(f"==== VisionDataModule Test ({dataset_name}) ====")
     print("Device                :", device)
-    print("Num classes           :", dm.num_classes)
-    print("Train dataset size    :", len(dm.train_dataset))
-    print("Val dataset size      :", len(dm.val_dataset))
-    print("Test dataset size     :", len(dm.test_dataset))
+    print("Dataset name          :", summary["dataset_name"])
+    print("Num classes           :", summary["num_classes"])
+    print("Train dataset size    :", summary["train_size"])
+    print("Val dataset size      :", summary["val_size"])
+    print("Test dataset size     :", summary["test_size"])
     print("Train images shape    :", train_images.shape)
     print("Train labels shape    :", train_labels.shape)
     print("Val images shape      :", val_images.shape)

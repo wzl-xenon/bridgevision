@@ -27,7 +27,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset_name",
         type=str,
         default="oxfordiiitpet",
-        choices=["oxfordiiitpet", "flowers102"],
+        choices=["oxfordiiitpet", "flowers102", "dtd", "fgvc_aircraft", "country211", "food101"],
+    )
+    parser.add_argument("--food101_train_ratio", type=float, default=0.9)
+    parser.add_argument("--dtd_partition", type=int, default=1)
+    parser.add_argument(
+        "--aircraft_annotation_level",
+        type=str,
+        default="variant",
+        choices=["variant", "family", "manufacturer"],
     )
     parser.add_argument("--data_root", type=str, default="./data")
     parser.add_argument("--image_size", type=int, default=224)
@@ -57,12 +65,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--fusion_type",
         type=str,
         default="concat",
-        choices=["concat", "gated"],
+        choices=["concat", "gated", "token_bridge"],
     )
     parser.add_argument("--fusion_dim", type=int, default=512)
     parser.add_argument("--projector_hidden_dim", type=int, default=1024)
     parser.add_argument("--fusion_hidden_dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--token_num_heads", type=int, default=8)
+    parser.add_argument("--token_gate_hidden_dim", type=int, default=None)
+    parser.add_argument("--token_ffn_hidden_dim", type=int, default=None)
+    parser.add_argument("--disable_token_gate", action="store_false", dest="token_use_gate")
+    parser.set_defaults(token_use_gate=True)
+    parser.add_argument("--num_bridge_layers", type=int, default=1)
+    parser.add_argument("--summary_fusion_type", type=str, default="gated", choices=["concat", "gated"])
+    parser.add_argument("--disable_cnn_pos_embed", action="store_false", dest="use_cnn_pos_embed")
+    parser.set_defaults(use_cnn_pos_embed=True)
+    parser.add_argument("--cnn_pos_embed_base_size", type=int, default=7)
 
     # ---------------------------
     # Eval / 评估相关
@@ -111,6 +129,9 @@ def resolve_data_config(args: argparse.Namespace, checkpoint: dict[str, Any]) ->
         "image_size": ckpt_data_config.get("image_size", args.image_size),
         "split_seed": ckpt_data_config.get("split_seed", args.split_seed),
         "pet_train_ratio": ckpt_data_config.get("pet_train_ratio", args.pet_train_ratio),
+        "food101_train_ratio": ckpt_data_config.get("food101_train_ratio", args.food101_train_ratio),
+        "dtd_partition": ckpt_data_config.get("dtd_partition", args.dtd_partition),
+        "aircraft_annotation_level": ckpt_data_config.get("aircraft_annotation_level", args.aircraft_annotation_level),
     }
 
 
@@ -128,6 +149,14 @@ def build_model_config_from_args(args: argparse.Namespace, num_classes: int) -> 
         "projector_hidden_dim": args.projector_hidden_dim,
         "fusion_hidden_dim": args.fusion_hidden_dim,
         "dropout": args.dropout,
+        "token_num_heads": args.token_num_heads,
+        "token_gate_hidden_dim": args.token_gate_hidden_dim,
+        "token_ffn_hidden_dim": args.token_ffn_hidden_dim,
+        "token_use_gate": args.token_use_gate,
+        "num_bridge_layers": args.num_bridge_layers,
+        "summary_fusion_type": args.summary_fusion_type,
+        "use_cnn_pos_embed": args.use_cnn_pos_embed,
+        "cnn_pos_embed_base_size": args.cnn_pos_embed_base_size,
     }
 
 
@@ -147,15 +176,26 @@ def resolve_model_config(
                 f"Checkpoint num_classes={ckpt_num_classes} does not match dataset num_classes={num_classes}."
             )
 
+        # 兼容旧 checkpoint / Backward compatibility for older checkpoints
+        model_config.setdefault("token_num_heads", 8)
+        model_config.setdefault("token_gate_hidden_dim", None)
+        model_config.setdefault("token_ffn_hidden_dim", None)
+        model_config.setdefault("token_use_gate", True)
+        model_config.setdefault("num_bridge_layers", 1)
+        model_config.setdefault("summary_fusion_type", "gated")
+        model_config.setdefault("use_cnn_pos_embed", True)
+        model_config.setdefault("cnn_pos_embed_base_size", 7)
+
         # eval 只需要结构匹配，不需要再触发预训练权重下载
+        # Evaluation only needs structural match; pretrained download is unnecessary
         model_config["pretrained_backbones"] = False
         model_config["freeze_backbones"] = False
         model_config["num_classes"] = num_classes
 
         return model_config, "checkpoint"
-    else:
-        model_config = build_model_config_from_args(args, num_classes)
-        return model_config, "cli"
+
+    model_config = build_model_config_from_args(args, num_classes)
+    return model_config, "cli"
 
 
 def main() -> None:
@@ -231,6 +271,7 @@ def main() -> None:
     print(f"Split seed           : {resolved_data_config['split_seed']}")
     print(f"Pet train ratio      : {resolved_data_config['pet_train_ratio']}")
     print(f"Model mode           : {model_config['model_mode']}")
+    print(f"Fusion type          : {model_config['fusion_type']}")
     print(f"Saved epoch          : {checkpoint.get('epoch', 'N/A')}")
     print(f"Saved best_val_acc   : {checkpoint.get('best_val_acc', 'N/A')}")
     print("=" * 80)

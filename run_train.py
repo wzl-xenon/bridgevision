@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ---------------------------
     # Data / 数据相关
     # ---------------------------
-    parser.add_argument("--dataset_name", type=str, default="oxfordiiitpet", choices=["oxfordiiitpet", "flowers102"])
+    parser.add_argument("--dataset_name", type=str, default="oxfordiiitpet", choices=["oxfordiiitpet", "flowers102", "dtd", "fgvc_aircraft", "country211", "food101"])
     parser.add_argument("--data_root", type=str, default="./data")
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -29,6 +29,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--pet_train_ratio", type=float, default=0.9)
+    parser.add_argument("--food101_train_ratio", type=float, default=0.9)
+    parser.add_argument("--dtd_partition", type=int, default=1)
+    parser.add_argument(
+        "--aircraft_annotation_level",
+        type=str,
+        default="variant",
+        choices=["variant", "family", "manufacturer"],
+    )
 
     # ---------------------------
     # Model / 模型相关
@@ -40,11 +48,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pretrained_backbones", action="store_true")
     parser.add_argument("--freeze_backbones", action="store_true")
     parser.add_argument("--projector_type", type=str, default="mlp", choices=["linear", "mlp"])
-    parser.add_argument("--fusion_type", type=str, default="concat", choices=["concat", "gated"])
+    parser.add_argument("--fusion_type", type=str, default="concat", choices=["concat", "gated", "token_bridge"])
     parser.add_argument("--fusion_dim", type=int, default=512)
     parser.add_argument("--projector_hidden_dim", type=int, default=1024)
     parser.add_argument("--fusion_hidden_dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--token_num_heads", type=int, default=8)
+    parser.add_argument("--token_gate_hidden_dim", type=int, default=None)
+    parser.add_argument("--token_ffn_hidden_dim", type=int, default=None)
+    parser.add_argument("--disable_token_gate", action="store_false", dest="token_use_gate")
+    parser.set_defaults(token_use_gate=True)
+    parser.add_argument("--num_bridge_layers", type=int, default=1)
+    parser.add_argument("--summary_fusion_type", type=str, default="gated", choices=["concat", "gated"])
+    parser.add_argument("--disable_cnn_pos_embed", action="store_false", dest="use_cnn_pos_embed")
+    parser.set_defaults(use_cnn_pos_embed=True)
+    parser.add_argument("--cnn_pos_embed_base_size", type=int, default=7)
 
     # ---------------------------
     # Train / 训练相关
@@ -77,6 +95,34 @@ def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total_params, trainable_params
+
+
+def build_model_config(args: argparse.Namespace, num_classes: int) -> dict[str, object]:
+    """
+    构建模型配置字典 / Build model configuration dictionary
+    """
+    return {
+        "model_mode": args.model_mode,
+        "num_classes": num_classes,
+        "resnet_name": args.resnet_name,
+        "vit_name": args.vit_name,
+        "pretrained_backbones": args.pretrained_backbones,
+        "freeze_backbones": args.freeze_backbones,
+        "projector_type": args.projector_type,
+        "fusion_type": args.fusion_type,
+        "fusion_dim": args.fusion_dim,
+        "projector_hidden_dim": args.projector_hidden_dim,
+        "fusion_hidden_dim": args.fusion_hidden_dim,
+        "dropout": args.dropout,
+        "token_num_heads": args.token_num_heads,
+        "token_gate_hidden_dim": args.token_gate_hidden_dim,
+        "token_ffn_hidden_dim": args.token_ffn_hidden_dim,
+        "token_use_gate": args.token_use_gate,
+        "num_bridge_layers": args.num_bridge_layers,
+        "summary_fusion_type": args.summary_fusion_type,
+        "use_cnn_pos_embed": args.use_cnn_pos_embed,
+        "cnn_pos_embed_base_size": args.cnn_pos_embed_base_size,
+    }
 
 
 def main() -> None:
@@ -112,6 +158,9 @@ def main() -> None:
         use_imagenet_norm=True,
         split_seed=args.split_seed,
         pet_train_ratio=args.pet_train_ratio,
+        food101_train_ratio=args.food101_train_ratio,
+        dtd_partition=args.dtd_partition,
+        aircraft_annotation_level=args.aircraft_annotation_level,
     )
     datamodule.setup()
 
@@ -120,23 +169,21 @@ def main() -> None:
 
     num_classes = args.num_classes if args.num_classes is not None else datamodule.num_classes
 
+    model_config = build_model_config(args, num_classes)
+    data_config = {
+        "dataset_name": args.dataset_name,
+        "image_size": args.image_size,
+        "split_seed": args.split_seed,
+        "pet_train_ratio": args.pet_train_ratio,
+        "food101_train_ratio": args.food101_train_ratio,
+        "dtd_partition": args.dtd_partition,
+        "aircraft_annotation_level": args.aircraft_annotation_level,
+    }
+
     # ---------------------------
     # 2. Build model / 构建模型
     # ---------------------------
-    model = DualEncoderModel(
-        model_mode=args.model_mode,
-        num_classes=num_classes,
-        resnet_name=args.resnet_name,
-        vit_name=args.vit_name,
-        pretrained_backbones=args.pretrained_backbones,
-        freeze_backbones=args.freeze_backbones,
-        projector_type=args.projector_type,
-        fusion_type=args.fusion_type,
-        fusion_dim=args.fusion_dim,
-        projector_hidden_dim=args.projector_hidden_dim,
-        fusion_hidden_dim=args.fusion_hidden_dim,
-        dropout=args.dropout,
-    )
+    model = DualEncoderModel(**model_config)
 
     total_params, trainable_params = count_parameters(model)
     trainable_param_list = [p for p in model.parameters() if p.requires_grad]
@@ -154,6 +201,10 @@ def main() -> None:
     print(f"Fusion type         : {args.fusion_type}")
     print(f"Projector type      : {args.projector_type}")
     print(f"Fusion dim          : {args.fusion_dim}")
+    print(f"Token heads         : {args.token_num_heads}")
+    print(f"Bridge layers       : {args.num_bridge_layers}")
+    print(f"Summary fusion      : {args.summary_fusion_type}")
+    print(f"Use CNN pos embed   : {args.use_cnn_pos_embed}")
     print(f"Total params        : {total_params:,}")
     print(f"Trainable params    : {trainable_params:,}")
     print(f"TORCH_HOME          : {torch_home}")
@@ -170,20 +221,7 @@ def main() -> None:
     )
 
     checkpoint_meta = {
-        "model_config": {
-            "model_mode": args.model_mode,
-            "num_classes": num_classes,
-            "resnet_name": args.resnet_name,
-            "vit_name": args.vit_name,
-            "pretrained_backbones": args.pretrained_backbones,
-            "freeze_backbones": args.freeze_backbones,
-            "projector_type": args.projector_type,
-            "fusion_type": args.fusion_type,
-            "fusion_dim": args.fusion_dim,
-            "projector_hidden_dim": args.projector_hidden_dim,
-            "fusion_hidden_dim": args.fusion_hidden_dim,
-            "dropout": args.dropout,
-        },
+        "model_config": model_config,
         "data_config": {
             "dataset_name": args.dataset_name,
             "image_size": args.image_size,
@@ -207,6 +245,12 @@ def main() -> None:
     # ---------------------------
     # 4. Build trainer / 构建训练器
     # ---------------------------
+    checkpoint_meta = {
+        "model_config": model_config,
+        "data_config": data_config,
+        "args": vars(args),
+    }
+
     trainer = Trainer(
         model=model,
         device=device,
