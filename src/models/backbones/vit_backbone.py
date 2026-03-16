@@ -1,5 +1,3 @@
-# src/models/backbones/vit_backbone.py
-
 from __future__ import annotations
 
 from typing import Dict
@@ -11,8 +9,8 @@ os.environ.setdefault("TORCHVISION_DISABLE_NMS_EXPORT", "1")
 import torch
 import torch.nn as nn
 
-# 为部分缺少 torchvision::nms 注册的环境提供兼容占位符
-# Provide a compatibility stub for environments missing torchvision::nms registration
+# 为缺少 torchvision::nms 的环境提供兼容占位符 / Provide a compatibility
+# stub for environments where torchvision::nms is unavailable during import.
 try:
     lib = torch.library.Library("torchvision", "DEF")
     lib.define("nms(Tensor dets, Tensor scores, float iou_threshold) -> Tensor")
@@ -23,19 +21,8 @@ from torchvision import models
 
 
 class ViTBackbone(nn.Module):
-    """
-    Vision Transformer backbone wrapper / ViT 主干网络封装
-
-    功能 / Features:
-    1. 支持 torchvision 的 vit_b_16 / vit_b_32 / vit_l_16 / vit_l_32
-       Support standard torchvision ViT backbones
-    2. 支持是否加载预训练权重
-       Support pretrained weights
-    3. 支持是否冻结 backbone 参数
-       Support freezing backbone parameters
-    4. 返回 cls token、patch tokens 和全部 tokens
-       Return cls token, patch tokens, and all tokens
-    """
+    """封装 torchvision ViT，并暴露 cls 与 patch token / Wrap a torchvision
+    ViT and expose cls and patch tokens."""
 
     _MODEL_FACTORY = {
         "vit_b_16": models.vit_b_16,
@@ -74,13 +61,7 @@ class ViTBackbone(nn.Module):
 
         model_fn = self._MODEL_FACTORY[model_name]
         weight_enum = self._WEIGHT_FACTORY[model_name]
-
-        # 根据是否使用预训练权重初始化 ViT
-        # Initialize ViT with or without pretrained weights
-        if pretrained:
-            self.backbone = model_fn(weights=weight_enum.DEFAULT)
-        else:
-            self.backbone = model_fn(weights=None)
+        self.backbone = model_fn(weights=weight_enum.DEFAULT if pretrained else None)
 
         self.model_name = model_name
         self.hidden_dim = self._HIDDEN_DIM[model_name]
@@ -89,74 +70,34 @@ class ViTBackbone(nn.Module):
             self.freeze_parameters()
 
     def freeze_parameters(self) -> None:
-        """
-        冻结所有参数 / Freeze all parameters
-        """
+        """冻结全部主干参数 / Freeze all backbone parameters."""
         for param in self.parameters():
             param.requires_grad = False
 
     def unfreeze_parameters(self) -> None:
-        """
-        解冻所有参数 / Unfreeze all parameters
-        """
+        """解冻全部主干参数 / Unfreeze all backbone parameters."""
         for param in self.parameters():
             param.requires_grad = True
 
     def forward_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        提取所有 token / Extract all tokens
-
-        Args:
-            x: [B, 3, H, W]
-
-        Returns:
-            all_tokens: [B, 1 + N, D]
-                - 第 0 个 token 是 cls token
-                  The first token is the cls token
-                - 后面是 patch tokens
-                  The rest are patch tokens
-        """
-        # 1. 把输入图像转成 patch embeddings
-        # Convert image to patch embeddings
-        x = self.backbone._process_input(x)  # [B, N, D]
+        """返回完整 token 序列 / Return the full token sequence with shape
+        [B, 1 + N, D]."""
+        x = self.backbone._process_input(x)
         batch_size = x.shape[0]
 
-        # 2. 拼接 cls token
-        # Concatenate cls token
-        cls_token = self.backbone.class_token.expand(batch_size, -1, -1)  # [B, 1, D]
-        x = torch.cat([cls_token, x], dim=1)                               # [B, 1+N, D]
-
-        # 3. 送入 Transformer encoder
-        # Feed into Transformer encoder
-        x = self.backbone.encoder(x)                                       # [B, 1+N, D]
-
+        cls_token = self.backbone.class_token.expand(batch_size, -1, -1)
+        x = torch.cat([cls_token, x], dim=1)
+        x = self.backbone.encoder(x)
         return x
 
     def forward_cls(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        仅返回 cls token 特征 / Return cls token feature only
-
-        Args:
-            x: [B, 3, H, W]
-
-        Returns:
-            cls_feature: [B, D]
-        """
+        """只返回 cls token / Return only the cls token with shape [B, D]."""
         all_tokens = self.forward_tokens(x)
-        cls_feature = all_tokens[:, 0]
-        return cls_feature
+        return all_tokens[:, 0]
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        前向传播 / Forward pass
-
-        Returns:
-            {
-                "cls_feature": [B, D],
-                "patch_tokens": [B, N, D],
-                "all_tokens": [B, 1+N, D],
-            }
-        """
+        """返回 cls 特征、patch token 和完整 token 序列 / Return cls features,
+        patch tokens, and the full token sequence."""
         all_tokens = self.forward_tokens(x)
         cls_feature = all_tokens[:, 0]
         patch_tokens = all_tokens[:, 1:]
@@ -169,13 +110,7 @@ class ViTBackbone(nn.Module):
 
 
 def _demo_forward() -> None:
-    """
-    简单前向传播测试 / Simple forward test
-    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 构造一个假的输入 batch
-    # Create a fake input batch
     x = torch.randn(2, 3, 224, 224).to(device)
 
     model = ViTBackbone(
@@ -189,10 +124,10 @@ def _demo_forward() -> None:
         outputs = model(x)
 
     print("==== ViT Backbone Forward Test ====")
-    print("Input shape       :", x.shape)
-    print("CLS feature shape :", outputs["cls_feature"].shape)
-    print("Patch tokens shape:", outputs["patch_tokens"].shape)
-    print("All tokens shape  :", outputs["all_tokens"].shape)
+    print("Input shape        :", x.shape)
+    print("CLS feature shape  :", outputs["cls_feature"].shape)
+    print("Patch tokens shape :", outputs["patch_tokens"].shape)
+    print("All tokens shape   :", outputs["all_tokens"].shape)
 
 
 if __name__ == "__main__":

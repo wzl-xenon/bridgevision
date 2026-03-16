@@ -1,236 +1,328 @@
 # BridgeVision
 
-## 项目简介
-BridgeVision是一个基于PyTorch的开源多模态融合视觉分类框架，创新性地结合了卷积神经网络（CNN）和视觉Transformer（ViT）两种不同架构的优势，通过多层级的特征融合策略实现更优的图像分类性能。
+BridgeVision 是一个基于 PyTorch 的图像分类实验框架，核心目标是研究 CNN 与 ViT 的双分支融合（dual-encoder fusion）。
 
-框架采用高度模块化设计，支持全局特征融合（Concat/Gated）和Token级双向交叉注意力融合（Token Bridge）两种模式，同时也支持单编码器模式（仅ResNet/仅ViT）作为对照实验，既可以作为学术研究的基准框架，也可以作为工业界落地的基础方案。
+这个项目目前更偏向研究与实验（research / experimentation），而不是产品化部署。它提供了统一的数据加载、训练、评估和 checkpoint 管理流程，适合快速验证不同融合策略的效果。
 
-## 核心特性
-✨ **多模式支持**：支持三种运行模式 - 双编码器融合模式、仅ResNet模式、仅ViT模式
-🔧 **多层级融合**：内置三种融合策略 - Concat拼接融合、Gated门控自适应融合、Token Bridge交叉注意力融合
-📦 **多数据集支持**：开箱即用支持6个标准数据集 - Oxford-IIIT Pets、Flowers102、DTD、FGVC Aircraft、Country211、Food101
-⚙️ **高度模块化**：主干网络、投影器、融合模块、分类头全部分离，可灵活配置替换
-🚀 **工程化完备**：支持自动混合精度训练、最佳Checkpoint自动保存、进度条显示、指标记录
-💾 **可复现设计**：训练时自动保存完整的模型配置和数据配置到Checkpoint，评估时无需手动配置参数
-🎛️ **高可配置性**：所有核心参数支持命令行动态调整，无需修改代码
-📂 **本地缓存支持**：支持自定义预训练权重缓存目录，避免重复下载
+当前重点支持三类融合思路：
+- 全局特征融合（global-feature fusion）：`concat`、`gated`
+- token 级双向交互（token-level bridge）：`token_bridge`
+- 固定长度 token 对齐后再做逐维门控融合：`matched_token_gated`
 
-## 环境要求
-- Python >= 3.8
-- PyTorch >= 1.12.0
-- TorchVision >= 0.13.0
-- tqdm >= 4.64.0
-- Pillow >= 9.0.0
-- PyYAML >= 6.0 (可选，用于配置文件模式)
+## 1. 项目概览
 
-## 安装步骤
-1. 克隆项目到本地
-```bash
-git clone <repository-url>
-cd BridgeVision
-```
+当前仓库的主要入口如下：
 
-2. 安装依赖
-```bash
+- 训练入口（training entry）：[run_train.py](/D:/workspace/bridgevision/run_train.py)
+- 评估入口（evaluation entry）：[run_eval.py](/D:/workspace/bridgevision/run_eval.py)
+- 主模型（main model）：[src/models/dual_encoder_model.py](/D:/workspace/bridgevision/src/models/dual_encoder_model.py)
+- 数据模块（data module）：[src/data/datamodule.py](/D:/workspace/bridgevision/src/data/datamodule.py)
+
+需要注意：
+- 当前项目主要通过命令行参数（CLI arguments）进行配置。
+- `configs/` 目录目前保留着，但还不是主要配置入口。
+
+## 2. 支持的模式
+
+### 2.1 模型模式（Model Modes）
+
+- `dual`
+  同时启用 ResNet 和 ViT 两个分支。
+- `resnet_only`
+  只运行 CNN 基线。
+- `vit_only`
+  只运行 ViT 基线。
+
+### 2.2 融合方式（Fusion Types）
+
+- `concat`
+  将两个全局特征拼接后送入 MLP 做融合。
+- `gated`
+  使用门控（gate）对两个全局特征做加权融合。
+- `token_bridge`
+  让 CNN tokens 与 ViT tokens 做双向 cross-attention，再从摘要 token 读出分类特征。
+- `matched_token_gated`
+  先进行 token bridge，再把两路 token 重采样到固定长度 `N_m`，最后在 `[B, N_m, D]` 上做逐 token、逐维门控融合。
+
+## 3. 支持的数据集
+
+当前 `VisionDataModule` 支持以下数据集：
+
+- `oxfordiiitpet`
+- `flowers102`
+- `dtd`
+- `fgvc_aircraft`
+- `country211`
+- `food101`
+
+数据划分策略做了统一封装：
+- 如果数据集官方提供 `train / val / test`，就直接使用官方划分。
+- 如果官方只提供 `train / test` 或 `trainval / test`，项目会按固定随机种子稳定切分出 `train / val`。
+
+## 4. 环境与依赖（Environment）
+
+本仓库最近一次验证环境如下：
+
+- Python `3.12.12`
+- PyTorch `2.10.0`
+- TorchVision `0.25.0`
+- tqdm `4.67.3`
+- Pillow `12.0.0`
+- pytest `9.0.2`
+
+安装依赖：
+
+```powershell
 pip install -r requirements.txt
 ```
 
-3. 预下载预训练权重（可选，首次训练时会自动下载）
-```bash
+如果你需要指定 CUDA 版本，建议先按 PyTorch 官方方式安装匹配的 `torch` / `torchvision`，再执行上面的命令补齐其余依赖。
+
+## 5. 快速开始（Quick Start）
+
+### 5.1 预下载预训练权重
+
+```powershell
 python tool/predownload_weights.py
 ```
 
-## 快速开始
-### 1. 训练模型
-#### 基础双编码器融合训练（Concat全局融合）
-```bash
-python run_train.py \
-  --dataset_name oxfordiiitpet \
-  --pretrained_backbones \
-  --model_mode dual \
-  --fusion_type concat \
-  --projector_type mlp \
-  --epochs 10 \
-  --batch_size 8 \
-  --lr 1e-4 \
-  --save_dir ./outputs/checkpoints/concat_exp
+### 5.2 下载数据集
+
+下载单个数据集：
+
+```powershell
+python tool/download_dataset.py --dataset_name oxfordiiitpet --data_root ./data
 ```
 
-#### 门控融合训练
-```bash
-python run_train.py \
-  --dataset_name flowers102 \
-  --pretrained_backbones \
-  --fusion_type gated \
-  --epochs 20 \
-  --batch_size 4 \
-  --use_amp
+下载全部支持的数据集：
+
+```powershell
+python tool/download_dataset.py --dataset_name all --data_root ./data
 ```
 
-#### Token Bridge融合训练（Token级交叉注意力）
-```bash
-python run_train.py \
-  --dataset_name food101 \
-  --pretrained_backbones \
-  --fusion_type token_bridge \
-  --num_bridge_layers 2 \
-  --token_num_heads 8 \
-  --summary_fusion_type gated \
-  --epochs 15 \
-  --batch_size 4 \
-  --use_amp
+### 5.3 训练一个全局融合基线
+
+```powershell
+python run_train.py --dataset_name oxfordiiitpet --data_root ./data --download --model_mode dual --fusion_type concat --projector_type mlp --pretrained_backbones --epochs 10 --batch_size 8 --lr 1e-4 --save_dir ./outputs/checkpoints/concat_exp
 ```
 
-#### 单ResNet基准训练
-```bash
-python run_train.py \
-  --dataset_name dtd \
-  --pretrained_backbones \
-  --model_mode resnet_only \
-  --epochs 10 \
-  --batch_size 16
+### 5.4 训练 token bridge 模型
+
+```powershell
+python run_train.py --dataset_name oxfordiiitpet --data_root ./data --download --image_size 224 --batch_size 8 --num_workers 0 --model_mode dual --resnet_name resnet18 --vit_name vit_b_32 --pretrained_backbones --projector_type mlp --fusion_type token_bridge --fusion_dim 256 --projector_hidden_dim 512 --fusion_hidden_dim 256 --token_num_heads 8 --token_gate_hidden_dim 256 --token_ffn_hidden_dim 512 --num_bridge_layers 1 --summary_fusion_type gated --epochs 30 --lr 1e-4 --weight_decay 1e-4 --use_amp --save_dir ./outputs/checkpoints/token_bridge_ep30
 ```
 
-#### 单ViT基准训练
-```bash
-python run_train.py \
-  --dataset_name fgvc_aircraft \
-  --pretrained_backbones \
-  --model_mode vit_only \
-  --epochs 15 \
-  --batch_size 8
+### 5.5 训练固定长度 token 门控融合模型
+
+这是当前项目里较新的 readout 方案：
+
+```powershell
+python run_train.py --dataset_name oxfordiiitpet --data_root ./data --download --image_size 224 --batch_size 8 --num_workers 0 --model_mode dual --resnet_name resnet18 --vit_name vit_b_32 --pretrained_backbones --projector_type mlp --fusion_type matched_token_gated --fusion_dim 256 --projector_hidden_dim 512 --fusion_hidden_dim 256 --token_num_heads 8 --token_gate_hidden_dim 256 --token_ffn_hidden_dim 512 --num_bridge_layers 1 --matched_token_count 12 --epochs 30 --lr 1e-4 --weight_decay 1e-4 --use_amp --save_dir ./outputs/checkpoints/matched_token_gated_ep30
 ```
 
-### 2. 评估模型
-> 评估时会自动从Checkpoint中加载模型和数据配置，无需手动指定大部分参数
-```bash
-python run_eval.py \
-  --checkpoint_path ./outputs/checkpoints/concat_exp/best_model.pt \
-  --split test
+### 5.6 评估模型
+
+```powershell
+python run_eval.py --checkpoint_path ./outputs/checkpoints/matched_token_gated_ep30/best_model.pt --split test
 ```
 
-快速验证（仅跑前10个batch）：
-```bash
-python run_eval.py \
-  --checkpoint_path ./outputs/checkpoints/token_bridge_exp/best_model.pt \
-  --split val \
-  --max_eval_batches 10
+### 5.7 运行前向 shape 测试
+
+```powershell
+pytest tests/test_model_forward.py
 ```
 
-## 主要参数说明
-### 数据相关参数
-| 参数名 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| --dataset_name | str | oxfordiiitpet | 数据集名称，支持 oxfordiiitpet / flowers102 / dtd / fgvc_aircraft / country211 / food101 |
-| --data_root | str | ./data | 数据集存放根目录 |
-| --image_size | int | 224 | 模型输入图像尺寸 |
-| --batch_size | int | 4 | Batch大小 |
-| --num_workers | int | 0 | DataLoader worker数量 |
-| --download | action | False | 是否自动下载数据集 |
-| --split_seed | int | 42 | 数据集划分随机种子 |
-| --pet_train_ratio | float | 0.9 | Oxford-IIIT Pets训练集划分比例 |
-| --food101_train_ratio | float | 0.9 | Food101训练集划分比例 |
-| --dtd_partition | int | 1 | DTD数据集分区编号（1~10） |
-| --aircraft_annotation_level | str | variant | FGVC Aircraft标签粒度，支持 variant / family / manufacturer |
+## 6. 模型结构说明
 
-### 模型相关参数
-| 参数名 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| --model_mode | str | dual | 模型运行模式，支持 dual / resnet_only / vit_only |
-| --num_classes | int | None | 类别数，默认自动从数据集推断 |
-| --resnet_name | str | resnet50 | ResNet主干版本，支持 resnet18/34/50/101 |
-| --vit_name | str | vit_b_16 | ViT主干版本，支持 vit_b_16/vit_b_32/vit_l_16/vit_l_32 |
-| --pretrained_backbones | action | False | 是否加载预训练主干权重 |
-| --freeze_backbones | action | False | 是否冻结主干网络参数 |
-| --projector_type | str | mlp | 投影器类型，支持 linear / mlp |
-| --fusion_type | str | concat | 融合模式，支持 concat / gated / token_bridge |
-| --fusion_dim | int | 512 | 特征融合维度 |
-| --dropout | float | 0.1 | Dropout比例 |
-| --token_num_heads | int | 8 | Token Bridge融合的注意力头数 |
-| --num_bridge_layers | int | 1 | Token Bridge融合的层数 |
-| --summary_fusion_type | str | gated | Token Bridge输出的全局融合方式 |
-| --disable_token_gate | action | False | 禁用Token Bridge中的门控机制 |
-| --disable_cnn_pos_embed | action | False | 禁用CNN特征的位置编码 |
+### 6.1 全局融合路径
 
-### 训练相关参数
-| 参数名 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| --epochs | int | 3 | 训练轮数 |
-| --lr | float | 1e-4 | 学习率 |
-| --weight_decay | float | 1e-4 | 权重衰减系数 |
-| --use_amp | action | False | 是否启用CUDA混合精度训练 |
-| --max_train_batches | int | None | 最大训练Batch数，用于快速测试 |
-| --max_val_batches | int | None | 最大验证Batch数，用于快速测试 |
-| --torch_home | str | ./pretrained/torch_home | 预训练权重缓存目录 |
-| --save_dir | str | ./outputs/checkpoints/run_train | 模型保存目录 |
+`concat` / `gated` 的数据流可以概括为：
 
-## 项目结构
-```
-BridgeVision/
-├─ README.md                    # 项目说明文档
-├─ requirements.txt             # 依赖包列表
-├─ run_train.py                 # 训练主入口
-├─ run_eval.py                  # 评估主入口
-├─ configs/                     # 配置文件目录（待实现）
-│  ├─ model.yaml                # 模型配置
-│  ├─ dataset.yaml              # 数据集配置
-│  └─ train.yaml                # 训练配置
-├─ src/                         # 核心源代码
-│  ├─ models/                   # 模型模块
-│  │  ├─ backbones/             # 主干网络
-│  │  │  ├─ resnet_backbone.py  # ResNet系列主干实现
-│  │  │  └─ vit_backbone.py     # ViT系列主干实现
-│  │  ├─ projectors/            # 特征投影器
-│  │  │  └─ projector.py        # 统一投影器实现
-│  │  ├─ fusions/               # 特征融合模块
-│  │  │  ├─ concat_fusion.py    # 拼接融合实现
-│  │  │  ├─ gated_fusion.py     # 门控融合实现
-│  │  │  └─ token_bridge_fusion.py # Token交叉注意力融合实现
-│  │  └─ dual_encoder_model.py  # 双编码器融合主模型
-│  ├─ data/                     # 数据处理模块
-│  │  └─ datamodule.py          # 多数据集加载与预处理（支持6个数据集）
-│  ├─ engine/                   # 训练引擎
-│  │  └─ trainer.py             # 训练评估循环实现
-│  ├─ losses/                   # 损失函数（待实现）
-│  │  └─ classification_loss.py # 分类损失
-│  └─ utils/                    # 工具函数（待实现）
-│     └─ logger.py              # 日志工具
-├─ outputs/                     # 输出目录
-│  ├─ checkpoints/              # 模型权重保存
-│  ├─ logs/                     # 日志文件
-│  └─ figures/                  # 可视化图表
-├─ pretrained/                  # 预训练权重缓存目录
-│  └─ torch_home/               # PyTorch官方预训练权重缓存
-├─ tests/                       # 单元测试（待实现）
-│  └─ test_model_forward.py     # 模型前向测试
-└─ tool/                        # 工具脚本
-   └─ predownload_weights.py    # 预训练权重下载
+`image -> ResNet pooled feature + ViT cls feature -> projector -> fusion -> classifier`
+
+这条路径简单、稳定，适合作为 baseline。
+
+### 6.2 token bridge 路径
+
+`token_bridge` 的核心流程：
+
+`image -> ResNet feature map + pooled feature`
+
+`image -> ViT full token sequence`
+
+`CNN feature map -> spatial tokens + CNN global token`
+
+`CNN tokens / ViT tokens -> shared hidden space`
+
+`-> one or more TokenBridgeFusion blocks`
+
+`-> read summary tokens`
+
+`-> summary fusion`
+
+`-> classifier`
+
+这里的 `TokenBridgeFusion` 会做双向 cross-attention：
+- `CNN <- ViT`
+- `ViT <- CNN`
+
+然后配合 gate 和 FFN refinement 完成 token 级交互。
+
+### 6.3 matched token gated 路径
+
+`matched_token_gated` 在 token bridge 之后再多做两步：
+
+1. 将两路 token 重采样到固定长度 `N_m`
+2. 在 `[B, N_m, D]` 上做逐 token、逐维度的门控融合
+
+高层流程如下：
+
+`image -> dual backbones -> token bridge -> fixed token alignment -> token-dim gated fusion -> mean pooling -> classifier`
+
+这条路径的目的，是让最终分类不仅依赖第一个 token，而是让全部对齐后的融合 token 共同参与决策。
+
+## 7. 数据流（Data Flow）
+
+训练时的总体流向：
+
+`dataset -> datamodule -> dataloader -> model -> logits -> cross entropy -> backward -> optimizer step`
+
+checkpoint 中会保存：
+
+- 模型权重（model weights）
+- 模型配置（model config）
+- 数据配置（data config）
+- 训练配置（train config）
+- 最佳验证精度（best validation accuracy）
+
+日志默认保存在：
+
+```text
+outputs/checkpoints/<run_name>/logs/
 ```
 
-## 基准测试结果
-| 数据集 | 模型模式 | 融合模式 | Top-1准确率 |
-|--------|----------|----------|-------------|
-| Oxford-IIIT Pets (37类) | dual | concat | 待补充 |
-| Oxford-IIIT Pets (37类) | dual | gated | 待补充 |
-| Oxford-IIIT Pets (37类) | dual | token_bridge | 待补充 |
-| Oxford-IIIT Pets (37类) | resnet_only | - | 待补充 |
-| Oxford-IIIT Pets (37类) | vit_only | - | 待补充 |
-| Flowers102 (102类) | dual | token_bridge | 待补充 |
-| Food101 (101类) | dual | token_bridge | 待补充 |
+常见输出文件包括：
 
-> 欢迎提交您的实验结果到本项目！
+- `config.json`
+- `metrics.csv`
+- `history.json`
+- `summary.json`
+- `train.log`
+- `debug.jsonl`（开启 debug logging 时）
 
-## 开发计划
-- [ ] 实现基于YAML的配置文件系统
-- [ ] 添加更多主干网络支持（Swin Transformer、ConvNeXt等）
-- [ ] 支持更多数据集（ImageNet、CIFAR等）
-- [ ] 添加TensorBoard/WandB日志支持
-- [ ] 完善单元测试覆盖
-- [ ] 实现分布式训练支持
-- [ ] 支持自监督预训练
+## 8. 常用参数说明
 
-## 许可证
-MIT License
+### 数据相关
 
-## 贡献
-欢迎提交Issue和Pull Request！
+- `--dataset_name`
+  选择数据集。
+- `--data_root`
+  数据集根目录。
+- `--image_size`
+  输入图像尺寸。
+- `--batch_size`
+  batch size。
+- `--download`
+  若支持则自动下载数据集。
+- `--split_seed`
+  控制稳定划分 train / val 的随机种子。
+
+### 模型相关
+
+- `--model_mode`
+  `dual`、`resnet_only` 或 `vit_only`。
+- `--resnet_name`
+  `resnet18`、`resnet34`、`resnet50`、`resnet101`。
+- `--vit_name`
+  `vit_b_16`、`vit_b_32`、`vit_l_16`、`vit_l_32`。
+- `--pretrained_backbones`
+  是否加载 torchvision 预训练权重。
+- `--freeze_backbones`
+  是否冻结 backbone 参数。
+- `--fusion_type`
+  `concat`、`gated`、`token_bridge`、`matched_token_gated`。
+- `--fusion_dim`
+  共享隐藏维度（shared hidden dimension）。
+
+### token 融合相关
+
+- `--token_num_heads`
+  多头注意力 head 数。
+- `--token_gate_hidden_dim`
+  token gate MLP 的隐藏维度。
+- `--token_ffn_hidden_dim`
+  token FFN 的隐藏维度。
+- `--num_bridge_layers`
+  bridge block 层数。
+- `--matched_token_count`
+  `matched_token_gated` 中固定 token 数。
+- `--summary_fusion_type`
+  `token_bridge` 模式下摘要特征的融合方式。
+- `--disable_token_gate`
+  禁用 bridge 内部 gate。
+- `--disable_cnn_pos_embed`
+  禁用 CNN 位置编码。
+
+### 训练相关
+
+- `--epochs`
+  训练轮数。
+- `--lr`
+  学习率。
+- `--weight_decay`
+  权重衰减。
+- `--use_amp`
+  启用混合精度（AMP）。
+- `--max_train_batches`
+  仅跑部分 train batches，适合调试。
+- `--max_val_batches`
+  仅跑部分 val batches，适合调试。
+- `--save_dir`
+  checkpoint 与日志输出目录。
+
+## 9. 目录结构
+
+```text
+bridgevision/
+|-- README.md
+|-- requirements.txt
+|-- run_train.py
+|-- run_eval.py
+|-- src/
+|   |-- data/
+|   |   `-- datamodule.py
+|   |-- engine/
+|   |   `-- trainer.py
+|   |-- losses/
+|   |   `-- classification_loss.py
+|   |-- models/
+|   |   |-- backbones/
+|   |   |-- embeddings/
+|   |   |-- fusions/
+|   |   |-- projectors/
+|   |   |-- tokenizers/
+|   |   |-- dual_encoder_model.py
+|   |   `-- token_bridge_model.py
+|   `-- utils/
+|       `-- logger.py
+|-- tests/
+|   `-- test_model_forward.py
+`-- tool/
+    |-- download_dataset.py
+    `-- predownload_weights.py
+```
+
+## 10. 说明与建议
+
+- 这是一个实验框架（experiment framework），更适合做结构验证和对比实验。
+- 当前最主要的模型入口是 `DualEncoderModel`。
+- `matched_token_gated` 是当前较新的分支，适合研究“固定长度 token 对齐 + 逐维门控融合”的效果。
+- 项目目前已有基础前向 shape 测试，但还不是完整 benchmark 套件。
+
+如果你接下来准备继续做 token 级融合实验，建议优先从：
+- `resnet18 + vit_b_32`
+- `fusion_dim=256`
+- `num_bridge_layers=1`
+- `matched_token_count=12`
+
+这组配置开始，先验证训练稳定性，再逐步加大模型复杂度。

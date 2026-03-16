@@ -9,15 +9,15 @@ import torch.nn.functional as F
 from src.models.backbones.resnet_backbone import ResNetBackbone
 from src.models.backbones.vit_backbone import ViTBackbone
 from src.models.fusions.concat_fusion import ConcatFusion
-from src.models.fusions.gated_fusion import GatedFusion
+from src.models.fusions.gated_fusion import GatedFusion, TokenDimGatedFusion
 from src.models.fusions.token_bridge_fusion import TokenBridgeFusion
 from src.models.projectors.projector import Projector
+from src.models.tokenizers.fixed_token_resampler import FixedTokenResampler
 
 
 class ClassificationHead(nn.Module):
-    """
-    Simple classification head / 简单分类头
-    """
+    """将特征向量映射为分类 logits / Map a feature vector to classification
+    logits."""
 
     def __init__(
         self,
@@ -26,7 +26,6 @@ class ClassificationHead(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-
         self.head = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(input_dim, num_classes),
@@ -37,23 +36,11 @@ class ClassificationHead(nn.Module):
 
 
 class DualEncoderModel(nn.Module):
-    """
-    BridgeVision 第一阶段双编码器模型 / Stage-1 BridgeVision dual-encoder model
-
-    支持三种模式 / Supported modes:
-    1. dual
-       - concat/gated: 全局特征级融合
-         global-feature fusion
-       - token_bridge: token 级双向交叉注意力融合
-         token-level bidirectional cross-attention fusion
-    2. resnet_only
-       ResNet pooled_feature -> classifier
-    3. vit_only
-       ViT cls_feature -> classifier
-    """
+    """BridgeVision 第一阶段双编码器模型 / BridgeVision stage-1 dual-encoder
+    model."""
 
     SUPPORTED_MODEL_MODES = {"dual", "resnet_only", "vit_only"}
-    SUPPORTED_FUSION_TYPES = {"concat", "gated", "token_bridge"}
+    SUPPORTED_FUSION_TYPES = {"concat", "gated", "token_bridge", "matched_token_gated"}
     SUPPORTED_SUMMARY_FUSION_TYPES = {"concat", "gated"}
 
     def __init__(
@@ -65,7 +52,7 @@ class DualEncoderModel(nn.Module):
         pretrained_backbones: bool = False,
         freeze_backbones: bool = False,
         projector_type: Literal["linear", "mlp"] = "mlp",
-        fusion_type: Literal["concat", "gated", "token_bridge"] = "concat",
+        fusion_type: Literal["concat", "gated", "token_bridge", "matched_token_gated"] = "concat",
         fusion_dim: int = 512,
         projector_hidden_dim: int | None = None,
         fusion_hidden_dim: int | None = None,
@@ -75,6 +62,7 @@ class DualEncoderModel(nn.Module):
         token_ffn_hidden_dim: int | None = None,
         token_use_gate: bool = True,
         num_bridge_layers: int = 1,
+        matched_token_count: int = 16,
         summary_fusion_type: Literal["concat", "gated"] = "gated",
         use_cnn_pos_embed: bool = True,
         cnn_pos_embed_base_size: int = 7,
@@ -102,6 +90,9 @@ class DualEncoderModel(nn.Module):
         if num_bridge_layers < 1:
             raise ValueError("num_bridge_layers must be >= 1.")
 
+        if matched_token_count < 1:
+            raise ValueError("matched_token_count must be >= 1.")
+
         if cnn_pos_embed_base_size < 1:
             raise ValueError("cnn_pos_embed_base_size must be >= 1.")
 
@@ -119,6 +110,7 @@ class DualEncoderModel(nn.Module):
         self.token_ffn_hidden_dim = token_ffn_hidden_dim
         self.token_use_gate = token_use_gate
         self.num_bridge_layers = num_bridge_layers
+        self.matched_token_count = matched_token_count
         self.summary_fusion_type = summary_fusion_type
         self.use_cnn_pos_embed = use_cnn_pos_embed
         self.cnn_pos_embed_base_size = cnn_pos_embed_base_size
@@ -132,10 +124,9 @@ class DualEncoderModel(nn.Module):
         self.vit_token_projector: Projector | None = None
         self.token_fusion_blocks: nn.ModuleList | None = None
         self.summary_fusion: nn.Module | None = None
+        self.token_resampler: FixedTokenResampler | None = None
+        self.token_dim_fusion: TokenDimGatedFusion | None = None
 
-        # ---------------------------
-        # 1. Build backbones / 构建主干网络
-        # ---------------------------
         if self.model_mode in {"dual", "resnet_only"}:
             self.resnet_backbone = ResNetBackbone(
                 model_name=resnet_name,
@@ -150,9 +141,6 @@ class DualEncoderModel(nn.Module):
                 freeze=freeze_backbones,
             )
 
-        # ---------------------------
-        # 2. Build mode-specific modules / 按模式构建模块
-        # ---------------------------
         if self.model_mode == "dual":
             assert self.resnet_backbone is not None
             assert self.vit_backbone is not None
@@ -168,8 +156,16 @@ class DualEncoderModel(nn.Module):
                     fusion_hidden_dim=fusion_hidden_dim,
                     dropout=dropout,
                 )
-            else:
+            elif fusion_type == "token_bridge":
                 self._build_token_bridge_modules(
+                    resnet_out_dim=resnet_out_dim,
+                    vit_out_dim=vit_out_dim,
+                    projector_hidden_dim=projector_hidden_dim,
+                    fusion_hidden_dim=fusion_hidden_dim,
+                    dropout=dropout,
+                )
+            else:
+                self._build_matched_token_modules(
                     resnet_out_dim=resnet_out_dim,
                     vit_out_dim=vit_out_dim,
                     projector_hidden_dim=projector_hidden_dim,
@@ -179,20 +175,16 @@ class DualEncoderModel(nn.Module):
 
         elif self.model_mode == "resnet_only":
             assert self.resnet_backbone is not None
-
-            resnet_out_dim = self.resnet_backbone.out_channels
             self.classifier = ClassificationHead(
-                input_dim=resnet_out_dim,
+                input_dim=self.resnet_backbone.out_channels,
                 num_classes=num_classes,
                 dropout=dropout,
             )
 
         elif self.model_mode == "vit_only":
             assert self.vit_backbone is not None
-
-            vit_out_dim = self.vit_backbone.hidden_dim
             self.classifier = ClassificationHead(
-                input_dim=vit_out_dim,
+                input_dim=self.vit_backbone.hidden_dim,
                 num_classes=num_classes,
                 dropout=dropout,
             )
@@ -208,9 +200,8 @@ class DualEncoderModel(nn.Module):
         fusion_hidden_dim: int | None,
         dropout: float,
     ) -> None:
-        """
-        构建旧版全局特征融合模块 / Build legacy global-feature fusion modules
-        """
+        """构建旧版全局特征融合模块 / Build the modules used by legacy
+        global-feature fusion."""
         self.resnet_projector = Projector(
             input_dim=resnet_out_dim,
             output_dim=self.fusion_dim,
@@ -219,7 +210,6 @@ class DualEncoderModel(nn.Module):
             dropout=dropout,
             use_layernorm=True,
         )
-
         self.vit_projector = Projector(
             input_dim=vit_out_dim,
             output_dim=self.fusion_dim,
@@ -261,9 +251,8 @@ class DualEncoderModel(nn.Module):
         fusion_hidden_dim: int | None,
         dropout: float,
     ) -> None:
-        """
-        构建 token bridge 融合模块 / Build token-bridge fusion modules
-        """
+        """构建 token-bridge 融合模块 / Build the modules used by token-bridge
+        fusion."""
         self.resnet_token_projector = Projector(
             input_dim=resnet_out_dim,
             output_dim=self.fusion_dim,
@@ -272,7 +261,6 @@ class DualEncoderModel(nn.Module):
             dropout=dropout,
             use_layernorm=True,
         )
-
         self.vit_token_projector = Projector(
             input_dim=vit_out_dim,
             output_dim=self.fusion_dim,
@@ -313,12 +301,84 @@ class DualEncoderModel(nn.Module):
                 refine_output=True,
             )
 
-        # 可学习 CNN 全局 token 位置编码 / Learnable CNN global-token positional embedding
         self.cnn_global_pos_embed = nn.Parameter(torch.zeros(1, 1, self.fusion_dim))
-
-        # 可学习 2D CNN 空间位置编码底图 / Learnable 2D CNN spatial positional grid
         self.cnn_spatial_pos_embed = nn.Parameter(
-            torch.zeros(1, self.fusion_dim, self.cnn_pos_embed_base_size, self.cnn_pos_embed_base_size)
+            torch.zeros(
+                1,
+                self.fusion_dim,
+                self.cnn_pos_embed_base_size,
+                self.cnn_pos_embed_base_size,
+            )
+        )
+
+        nn.init.trunc_normal_(self.cnn_global_pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cnn_spatial_pos_embed, std=0.02)
+
+        self.classifier = ClassificationHead(
+            input_dim=self.fusion_dim,
+            num_classes=self.num_classes,
+            dropout=dropout,
+        )
+
+    def _build_matched_token_modules(
+        self,
+        resnet_out_dim: int,
+        vit_out_dim: int,
+        projector_hidden_dim: int | None,
+        fusion_hidden_dim: int | None,
+        dropout: float,
+    ) -> None:
+        """构建 token-bridge 与固定长度 token 融合模块 / Build token-bridge
+        modules followed by fixed-length token fusion."""
+        self.resnet_token_projector = Projector(
+            input_dim=resnet_out_dim,
+            output_dim=self.fusion_dim,
+            projector_type=self.projector_type,
+            hidden_dim=projector_hidden_dim,
+            dropout=dropout,
+            use_layernorm=True,
+        )
+        self.vit_token_projector = Projector(
+            input_dim=vit_out_dim,
+            output_dim=self.fusion_dim,
+            projector_type=self.projector_type,
+            hidden_dim=projector_hidden_dim,
+            dropout=dropout,
+            use_layernorm=True,
+        )
+
+        self.token_fusion_blocks = nn.ModuleList(
+            [
+                TokenBridgeFusion(
+                    feature_dim=self.fusion_dim,
+                    num_heads=self.token_num_heads,
+                    dropout=dropout,
+                    gate_hidden_dim=self.token_gate_hidden_dim,
+                    ffn_hidden_dim=self.token_ffn_hidden_dim,
+                    use_gate=self.token_use_gate,
+                    use_layernorm=True,
+                )
+                for _ in range(self.num_bridge_layers)
+            ]
+        )
+
+        self.token_resampler = FixedTokenResampler(target_tokens=self.matched_token_count)
+        self.token_dim_fusion = TokenDimGatedFusion(
+            feature_dim=self.fusion_dim,
+            hidden_dim=fusion_hidden_dim,
+            dropout=dropout,
+            use_layernorm=True,
+            refine_output=True,
+        )
+
+        self.cnn_global_pos_embed = nn.Parameter(torch.zeros(1, 1, self.fusion_dim))
+        self.cnn_spatial_pos_embed = nn.Parameter(
+            torch.zeros(
+                1,
+                self.fusion_dim,
+                self.cnn_pos_embed_base_size,
+                self.cnn_pos_embed_base_size,
+            )
         )
 
         nn.init.trunc_normal_(self.cnn_global_pos_embed, std=0.02)
@@ -331,9 +391,8 @@ class DualEncoderModel(nn.Module):
         )
 
     def extract_branch_features(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        提取分支特征 / Extract branch features
-        """
+        """提取各前向路径共享的 backbone 特征 / Extract the backbone features
+        that are shared across forward paths."""
         outputs: Dict[str, torch.Tensor] = {}
 
         if self.resnet_backbone is not None:
@@ -354,24 +413,20 @@ class DualEncoderModel(nn.Module):
         resnet_feature: torch.Tensor,
         vit_feature: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """
-        仅旧版 dual 全局融合需要 projector 对齐
-        Only legacy global dual fusion uses this projector alignment
-        """
-        if self.model_mode != "dual" or self.fusion_type == "token_bridge":
+        """将全局分支特征投影到共享融合空间 / Project global branch features
+        into the shared fusion space."""
+        if self.model_mode != "dual" or self.fusion_type not in {"concat", "gated"}:
             raise RuntimeError(
-                "align_features() is only available when model_mode='dual' and fusion_type is not 'token_bridge'."
+                "align_features() is only available when model_mode='dual' "
+                "and fusion_type is 'concat' or 'gated'."
             )
 
         assert self.resnet_projector is not None
         assert self.vit_projector is not None
 
-        resnet_projected = self.resnet_projector(resnet_feature)
-        vit_projected = self.vit_projector(vit_feature)
-
         return {
-            "resnet_projected": resnet_projected,
-            "vit_projected": vit_projected,
+            "resnet_projected": self.resnet_projector(resnet_feature),
+            "vit_projected": self.vit_projector(vit_feature),
         }
 
     def fuse_features(
@@ -379,22 +434,19 @@ class DualEncoderModel(nn.Module):
         resnet_projected: torch.Tensor,
         vit_projected: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """
-        仅旧版 dual 全局融合需要 feature fusion
-        Only legacy global dual fusion uses this feature fusion
-        """
-        if self.model_mode != "dual" or self.fusion_type == "token_bridge":
+        """对齐并融合旧版双分支的全局特征 / Fuse aligned global features for
+        the legacy dual-branch path."""
+        if self.model_mode != "dual" or self.fusion_type not in {"concat", "gated"}:
             raise RuntimeError(
-                "fuse_features() is only available when model_mode='dual' and fusion_type is not 'token_bridge'."
+                "fuse_features() is only available when model_mode='dual' "
+                "and fusion_type is 'concat' or 'gated'."
             )
 
         assert self.fusion is not None
 
         if self.fusion_type == "concat":
             fused_feature = self.fusion(resnet_projected, vit_projected)
-            return {
-                "fused_feature": fused_feature,
-            }
+            return {"fused_feature": fused_feature}
 
         if self.fusion_type == "gated":
             fused_feature, gate = self.fusion(
@@ -410,13 +462,8 @@ class DualEncoderModel(nn.Module):
         raise RuntimeError(f"Unexpected fusion_type={self.fusion_type}")
 
     def _get_cnn_spatial_pos_embed(self, height: int, width: int) -> torch.Tensor:
-        """
-        生成与当前 CNN 空间大小匹配的位置编码
-        Generate positional embeddings that match current CNN spatial size
-
-        Returns:
-            pos_embed: [1, H*W, D]
-        """
+        """将学习到的 CNN 空间位置网格缩放到当前特征图尺寸 / Resize the
+        learned CNN spatial position grid to the current feature map size."""
         assert hasattr(self, "cnn_spatial_pos_embed")
 
         pos_embed_2d = F.interpolate(
@@ -425,52 +472,35 @@ class DualEncoderModel(nn.Module):
             mode="bilinear",
             align_corners=False,
         )
-        pos_embed = pos_embed_2d.flatten(2).transpose(1, 2)  # [1, H*W, D]
-        return pos_embed
+        return pos_embed_2d.flatten(2).transpose(1, 2)
 
     def _build_cnn_tokens(
         self,
         feature_map: torch.Tensor,
         pooled_feature: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        构建 CNN global + spatial tokens
-        Build CNN global + spatial tokens
-
-        Args:
-            feature_map: [B, C, H, W]
-            pooled_feature: [B, C]
-
-        Returns:
-            cnn_tokens: [B, 1+H*W, D]
-            cnn_global_token: [B, 1, D]
-            cnn_spatial_tokens: [B, H*W, D]
-        """
+        """构建一个 CNN 全局 token 和展平后的空间 token / Build one global
+        CNN token plus flattened spatial tokens."""
         assert self.resnet_token_projector is not None
 
-        batch_size, _, height, width = feature_map.shape
-        del batch_size
+        _, _, height, width = feature_map.shape
 
-        # 展平 CNN 空间特征图为 token 序列 / Flatten CNN feature map into token sequence
-        cnn_spatial_tokens = feature_map.flatten(2).transpose(1, 2)  # [B, H*W, C]
-        cnn_global_token = pooled_feature.unsqueeze(1)               # [B, 1, C]
+        cnn_spatial_tokens = feature_map.flatten(2).transpose(1, 2)
+        cnn_global_token = pooled_feature.unsqueeze(1)
 
-        # 投影到共同隐藏空间 / Project to the shared hidden space
-        cnn_spatial_tokens = self.resnet_token_projector(cnn_spatial_tokens)  # [B, H*W, D]
-        cnn_global_token = self.resnet_token_projector(cnn_global_token)      # [B, 1, D]
+        cnn_spatial_tokens = self.resnet_token_projector(cnn_spatial_tokens)
+        cnn_global_token = self.resnet_token_projector(cnn_global_token)
 
-        # 加 CNN 位置编码 / Add CNN positional embeddings
         if self.use_cnn_pos_embed:
             cnn_global_token = cnn_global_token + self.cnn_global_pos_embed
             cnn_spatial_tokens = cnn_spatial_tokens + self._get_cnn_spatial_pos_embed(height, width)
 
-        cnn_tokens = torch.cat([cnn_global_token, cnn_spatial_tokens], dim=1)  # [B, 1+H*W, D]
+        cnn_tokens = torch.cat([cnn_global_token, cnn_spatial_tokens], dim=1)
         return cnn_tokens, cnn_global_token, cnn_spatial_tokens
 
     def _run_global_dual_forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        运行旧版全局特征双分支前向 / Run legacy global-feature dual forward
-        """
+        """执行旧版全局特征双分支前向 / Run the legacy dual-branch forward
+        pass with global feature fusion."""
         feature_dict = self.extract_branch_features(x)
         resnet_feature = feature_dict["resnet_feature"]
         vit_feature = feature_dict["vit_feature"]
@@ -494,14 +524,13 @@ class DualEncoderModel(nn.Module):
 
         if "gate" in fused_dict:
             outputs["gate"] = fused_dict["gate"]
+            outputs["fusion_gate"] = fused_dict["gate"]
 
         return outputs
 
     def _run_token_bridge_forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        运行 token bridge 双分支前向
-        Run dual-branch forward with token-bridge fusion
-        """
+        """执行 token-bridge 前向，并读取融合后的全局 token / Run the
+        token-bridge forward path and read out fused global tokens."""
         assert self.resnet_backbone is not None
         assert self.vit_backbone is not None
         assert self.resnet_token_projector is not None
@@ -520,7 +549,6 @@ class DualEncoderModel(nn.Module):
             feature_map=resnet_feature_map,
             pooled_feature=resnet_pooled_feature,
         )
-
         vit_tokens_projected = self.vit_token_projector(vit_tokens)
 
         fused_cnn_tokens = cnn_tokens
@@ -537,8 +565,6 @@ class DualEncoderModel(nn.Module):
             fused_cnn_tokens = last_bridge_outputs["fused_cnn_tokens"]
             fused_vit_tokens = last_bridge_outputs["fused_vit_tokens"]
 
-        # 只从融合后的全局 token 读出用于分类
-        # Read out classification features only from fused global tokens
         cnn_readout = fused_cnn_tokens[:, 0]
         vit_readout = fused_vit_tokens[:, 0]
 
@@ -572,6 +598,81 @@ class DualEncoderModel(nn.Module):
 
         if summary_gate is not None:
             outputs["summary_gate"] = summary_gate
+            outputs["fusion_gate"] = summary_gate
+
+        for key, value in last_bridge_outputs.items():
+            if key not in {"fused_cnn_tokens", "fused_vit_tokens"}:
+                outputs[key] = value
+
+        return outputs
+
+    def _run_matched_token_gated_forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """执行 token bridge、重采样双分支，再融合对齐 token / Run token
+        bridge, resample both branches, then fuse aligned tokens."""
+        assert self.resnet_backbone is not None
+        assert self.vit_backbone is not None
+        assert self.resnet_token_projector is not None
+        assert self.vit_token_projector is not None
+        assert self.token_fusion_blocks is not None
+        assert self.token_resampler is not None
+        assert self.token_dim_fusion is not None
+
+        resnet_out = self.resnet_backbone(x)
+        vit_out = self.vit_backbone(x)
+
+        resnet_feature_map = resnet_out["feature_map"]
+        resnet_pooled_feature = resnet_out["pooled_feature"]
+        vit_tokens = vit_out["all_tokens"]
+
+        cnn_tokens, cnn_global_token, cnn_spatial_tokens = self._build_cnn_tokens(
+            feature_map=resnet_feature_map,
+            pooled_feature=resnet_pooled_feature,
+        )
+        vit_tokens_projected = self.vit_token_projector(vit_tokens)
+
+        fused_cnn_tokens = cnn_tokens
+        fused_vit_tokens = vit_tokens_projected
+
+        last_bridge_outputs: dict[str, torch.Tensor] = {}
+        for bridge_block in self.token_fusion_blocks:
+            last_bridge_outputs = bridge_block(
+                cnn_tokens=fused_cnn_tokens,
+                vit_tokens=fused_vit_tokens,
+                return_gate=True,
+                return_attn_weights=False,
+            )
+            fused_cnn_tokens = last_bridge_outputs["fused_cnn_tokens"]
+            fused_vit_tokens = last_bridge_outputs["fused_vit_tokens"]
+
+        matched_cnn_tokens = self.token_resampler(fused_cnn_tokens)
+        matched_vit_tokens = self.token_resampler(fused_vit_tokens)
+        fused_matched_tokens, matched_gate = self.token_dim_fusion(
+            matched_cnn_tokens,
+            matched_vit_tokens,
+            return_gate=True,
+        )
+
+        pooled_feature = fused_matched_tokens.mean(dim=1)
+        logits = self.classifier(pooled_feature)
+
+        outputs: Dict[str, torch.Tensor] = {
+            "logits": logits,
+            "resnet_feature_map": resnet_feature_map,
+            "resnet_pooled_feature": resnet_pooled_feature,
+            "vit_tokens": vit_tokens,
+            "cnn_global_token": cnn_global_token,
+            "cnn_spatial_tokens": cnn_spatial_tokens,
+            "cnn_tokens": cnn_tokens,
+            "vit_tokens_projected": vit_tokens_projected,
+            "fused_cnn_tokens": fused_cnn_tokens,
+            "fused_vit_tokens": fused_vit_tokens,
+            "matched_cnn_tokens": matched_cnn_tokens,
+            "matched_vit_tokens": matched_vit_tokens,
+            "fused_matched_tokens": fused_matched_tokens,
+            "matched_gate": matched_gate,
+            "fusion_gate": matched_gate,
+            "fused_feature": pooled_feature,
+        }
 
         for key, value in last_bridge_outputs.items():
             if key not in {"fused_cnn_tokens", "fused_vit_tokens"}:
@@ -580,9 +681,7 @@ class DualEncoderModel(nn.Module):
         return outputs
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        前向传播 / Forward pass
-        """
+        """执行当前配置对应的前向路径 / Run the configured forward path."""
         if self.model_mode == "resnet_only":
             feature_dict = self.extract_branch_features(x)
             resnet_feature = feature_dict["resnet_feature"]
@@ -606,6 +705,8 @@ class DualEncoderModel(nn.Module):
         if self.model_mode == "dual":
             if self.fusion_type == "token_bridge":
                 return self._run_token_bridge_forward(x)
+            if self.fusion_type == "matched_token_gated":
+                return self._run_matched_token_gated_forward(x)
             return self._run_global_dual_forward(x)
 
         raise RuntimeError(f"Unexpected model_mode={self.model_mode}")

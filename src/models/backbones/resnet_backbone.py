@@ -1,5 +1,3 @@
-# src/models/backbones/resnet_backbone.py
-
 from __future__ import annotations
 
 from typing import Dict
@@ -11,8 +9,8 @@ os.environ.setdefault("TORCHVISION_DISABLE_NMS_EXPORT", "1")
 import torch
 import torch.nn as nn
 
-# 为部分缺少 torchvision::nms 注册的环境提供兼容占位符
-# Provide a compatibility stub for environments missing torchvision::nms registration
+# 为缺少 torchvision::nms 的环境提供兼容占位符 / Provide a compatibility
+# stub for environments where torchvision::nms is unavailable during import.
 try:
     lib = torch.library.Library("torchvision", "DEF")
     lib.define("nms(Tensor dets, Tensor scores, float iou_threshold) -> Tensor")
@@ -23,19 +21,8 @@ from torchvision import models
 
 
 class ResNetBackbone(nn.Module):
-    """
-    ResNet backbone wrapper / ResNet 主干网络封装
-
-    功能 / Features:
-    1. 支持 torchvision 的 resnet18/resnet34/resnet50/resnet101
-       Support resnet18/resnet34/resnet50/resnet101 from torchvision
-    2. 支持是否加载预训练权重
-       Support pretrained weights
-    3. 支持是否冻结 backbone 参数
-       Support freezing backbone parameters
-    4. 返回最后一层空间特征图和全局池化特征
-       Return both spatial feature map and pooled feature
-    """
+    """封装 torchvision ResNet，并暴露空间特征和池化特征 / Wrap a torchvision
+    ResNet and expose spatial and pooled features."""
 
     _MODEL_FACTORY = {
         "resnet18": models.resnet18,
@@ -74,16 +61,8 @@ class ResNetBackbone(nn.Module):
 
         model_fn = self._MODEL_FACTORY[model_name]
         weight_enum = self._WEIGHT_FACTORY[model_name]
+        backbone = model_fn(weights=weight_enum.DEFAULT if pretrained else None)
 
-        # 根据是否使用预训练权重初始化模型
-        # Initialize model with or without pretrained weights
-        if pretrained:
-            backbone = model_fn(weights=weight_enum.DEFAULT)
-        else:
-            backbone = model_fn(weights=None)
-
-        # 保留到 layer4，去掉分类头 fc
-        # Keep layers up to layer4, remove final classification head
         self.stem = nn.Sequential(
             backbone.conv1,
             backbone.bn1,
@@ -103,29 +82,18 @@ class ResNetBackbone(nn.Module):
             self.freeze_parameters()
 
     def freeze_parameters(self) -> None:
-        """
-        冻结所有参数 / Freeze all parameters
-        """
+        """冻结全部主干参数 / Freeze all backbone parameters."""
         for param in self.parameters():
             param.requires_grad = False
 
     def unfreeze_parameters(self) -> None:
-        """
-        解冻所有参数 / Unfreeze all parameters
-        """
+        """解冻全部主干参数 / Unfreeze all backbone parameters."""
         for param in self.parameters():
             param.requires_grad = True
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        提取最后的空间特征图 / Extract final spatial feature map
-
-        Args:
-            x: [B, 3, H, W]
-
-        Returns:
-            feature_map: [B, C, H_out, W_out]
-        """
+        """返回最后一层空间特征图 / Return the final spatial feature map with
+        shape [B, C, H, W]."""
         x = self.stem(x)
         x = self.layer1(x)
         x = self.layer2(x)
@@ -134,30 +102,14 @@ class ResNetBackbone(nn.Module):
         return x
 
     def forward_pooled(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        提取全局池化后的特征 / Extract pooled global feature
-
-        Args:
-            x: [B, 3, H, W]
-
-        Returns:
-            pooled_feature: [B, C]
-        """
+        """返回全局池化特征 / Return the pooled global feature with shape [B, C]."""
         feature_map = self.forward_features(x)
-        pooled = self.avgpool(feature_map)           # [B, C, 1, 1]
-        pooled = torch.flatten(pooled, start_dim=1)  # [B, C]
-        return pooled
+        pooled = self.avgpool(feature_map)
+        return torch.flatten(pooled, start_dim=1)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        前向传播 / Forward pass
-
-        Returns:
-            {
-                "feature_map": [B, C, H_out, W_out],
-                "pooled_feature": [B, C],
-            }
-        """
+        """同时返回空间特征图和池化特征 / Return both the spatial feature map
+        and pooled feature."""
         feature_map = self.forward_features(x)
         pooled_feature = self.avgpool(feature_map)
         pooled_feature = torch.flatten(pooled_feature, start_dim=1)
@@ -169,13 +121,7 @@ class ResNetBackbone(nn.Module):
 
 
 def _demo_forward() -> None:
-    """
-    简单前向传播测试 / Simple forward test
-    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 构造一个假的输入 batch
-    # Create a fake input batch
     x = torch.randn(2, 3, 224, 224).to(device)
 
     model = ResNetBackbone(
@@ -189,8 +135,8 @@ def _demo_forward() -> None:
         outputs = model(x)
 
     print("==== ResNet Backbone Forward Test ====")
-    print("Input shape        :", x.shape)
-    print("Feature map shape  :", outputs["feature_map"].shape)
+    print("Input shape         :", x.shape)
+    print("Feature map shape   :", outputs["feature_map"].shape)
     print("Pooled feature shape:", outputs["pooled_feature"].shape)
 
 

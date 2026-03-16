@@ -7,10 +7,6 @@ from src.models.fusions.token_bridge_fusion import TokenBridgeFusion
 
 
 def test_token_bridge_fusion_shapes() -> None:
-    """
-    测试 token bridge fusion 输出形状
-    Test token bridge fusion output shapes
-    """
     fusion = TokenBridgeFusion(
         feature_dim=128,
         num_heads=8,
@@ -40,10 +36,6 @@ def test_token_bridge_fusion_shapes() -> None:
 
 
 def test_dual_encoder_token_bridge_forward_shapes() -> None:
-    """
-    测试 dual + token_bridge 前向形状
-    Test forward shapes for dual + token_bridge
-    """
     model = DualEncoderModel(
         num_classes=5,
         model_mode="dual",
@@ -83,11 +75,46 @@ def test_dual_encoder_token_bridge_forward_shapes() -> None:
     assert outputs["logits"].shape == (2, 5)
 
 
+def test_dual_encoder_matched_token_gated_forward_shapes() -> None:
+    model = DualEncoderModel(
+        num_classes=5,
+        model_mode="dual",
+        resnet_name="resnet18",
+        vit_name="vit_b_32",
+        pretrained_backbones=False,
+        freeze_backbones=False,
+        projector_type="mlp",
+        fusion_type="matched_token_gated",
+        fusion_dim=128,
+        projector_hidden_dim=256,
+        fusion_hidden_dim=128,
+        dropout=0.0,
+        token_num_heads=8,
+        token_gate_hidden_dim=128,
+        token_ffn_hidden_dim=256,
+        token_use_gate=True,
+        num_bridge_layers=1,
+        matched_token_count=12,
+        summary_fusion_type="gated",
+        use_cnn_pos_embed=True,
+        cnn_pos_embed_base_size=7,
+    )
+    model.eval()
+
+    x = torch.randn(2, 3, 224, 224)
+
+    with torch.no_grad():
+        outputs = model(x)
+
+    assert outputs["matched_cnn_tokens"].shape == (2, 12, 128)
+    assert outputs["matched_vit_tokens"].shape == (2, 12, 128)
+    assert outputs["fused_matched_tokens"].shape == (2, 12, 128)
+    assert outputs["matched_gate"].shape == (2, 12, 128)
+    assert outputs["fused_feature"].shape == (2, 128)
+    assert outputs["logits"].shape == (2, 5)
+
+
 def test_resnet_only_forward_shapes() -> None:
-    """
-    测试 ResNet only 前向形状
-    Test forward shapes for ResNet-only mode
-    """
     model = DualEncoderModel(
         num_classes=5,
         model_mode="resnet_only",
@@ -109,10 +136,6 @@ def test_resnet_only_forward_shapes() -> None:
 
 
 def test_vit_only_forward_shapes() -> None:
-    """
-    测试 ViT only 前向形状
-    Test forward shapes for ViT-only mode
-    """
     model = DualEncoderModel(
         num_classes=5,
         model_mode="vit_only",

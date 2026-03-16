@@ -6,8 +6,8 @@ import torch.nn as nn
 
 class SpatialTokenizer(nn.Module):
     """
-    Convert CNN feature map [B, C, H, W] to spatial tokens [B, N, C],
-    where N = H * W.
+    将 CNN 特征图 [B, C, H, W] 转成空间 token [B, N, C] / Convert a CNN
+    feature map [B, C, H, W] into spatial tokens [B, N, C], where N = H * W.
     """
 
     def __init__(self) -> None:
@@ -19,13 +19,13 @@ class SpatialTokenizer(nn.Module):
         return_hw: bool = False,
     ):
         """
-        Args:
+        参数 / Args:
             feature_map: [B, C, H, W]
-            return_hw: whether to also return (H, W)
+            return_hw: 是否同时返回 (H, W) / Whether to also return (H, W)
 
-        Returns:
+        返回 / Returns:
             tokens: [B, H*W, C]
-            hw: (H, W), optional
+            hw: (H, W)，可选 / Optional
         """
         if feature_map.ndim != 4:
             raise ValueError(

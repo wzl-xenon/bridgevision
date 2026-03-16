@@ -8,10 +8,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from src.utils.logger import ExperimentLogger
+
 
 class Trainer:
     """
-    Simple trainer for image classification / 简单图像分类训练器
+    图像分类训练器 / Simple trainer for image classification.
     """
 
     def __init__(
@@ -24,6 +26,9 @@ class Trainer:
         use_amp: bool = True,
         save_dir: str = "./outputs/checkpoints",
         checkpoint_meta: dict[str, Any] | None = None,
+        experiment_logger: ExperimentLogger | None = None,
+        debug_interval: int = 0,
+        log_debug_gates: bool = False,
     ) -> None:
         self.model = model.to(device)
         self.device = device
@@ -31,18 +36,29 @@ class Trainer:
         self.criterion = criterion if criterion is not None else nn.CrossEntropyLoss()
         self.scheduler = scheduler
         self.use_amp = use_amp and device.type == "cuda"
+
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
+
         self.checkpoint_meta = checkpoint_meta or {}
 
-        self.amp_device_type = "cuda" if self.device.type == "cuda" else "cpu"
+        self.experiment_logger = experiment_logger
+        self.debug_interval = debug_interval
+        self.log_debug_gates = log_debug_gates
 
+        self.amp_device_type = "cuda" if self.device.type == "cuda" else "cpu"
         self.scaler = torch.amp.GradScaler(
             self.amp_device_type,
             enabled=self.use_amp,
         )
 
         self.best_val_acc = -1.0
+
+    def _log_info(self, message: str) -> None:
+        if self.experiment_logger is not None:
+            self.experiment_logger.info(message)
+        else:
+            print(message)
 
     def move_batch_to_device(
         self,
@@ -60,6 +76,74 @@ class Trainer:
         total = labels.size(0)
         return correct / total
 
+    def _tensor_gate_stats(self, gate_tensor: torch.Tensor, prefix: str) -> dict[str, float]:
+        gate_tensor = gate_tensor.detach().float()
+
+        return {
+            f"{prefix}_mean": gate_tensor.mean().item(),
+            f"{prefix}_min": gate_tensor.min().item(),
+            f"{prefix}_max": gate_tensor.max().item(),
+            f"{prefix}_open_ratio": (gate_tensor > 0.5).float().mean().item(),
+        }
+
+    def _extract_debug_stats(self, outputs: dict[str, torch.Tensor]) -> dict[str, float]:
+        debug_stats: dict[str, float] = {}
+
+        if "gate" in outputs and isinstance(outputs["gate"], torch.Tensor):
+            debug_stats.update(self._tensor_gate_stats(outputs["gate"], prefix="gate"))
+
+        if "fusion_gate" in outputs and isinstance(outputs["fusion_gate"], torch.Tensor):
+            debug_stats.update(self._tensor_gate_stats(outputs["fusion_gate"], prefix="fusion_gate"))
+
+        if "summary_gate" in outputs and isinstance(outputs["summary_gate"], torch.Tensor):
+            debug_stats.update(self._tensor_gate_stats(outputs["summary_gate"], prefix="summary_gate"))
+
+        if "cnn_gate" in outputs and isinstance(outputs["cnn_gate"], torch.Tensor):
+            debug_stats.update(self._tensor_gate_stats(outputs["cnn_gate"], prefix="cnn_gate"))
+
+        if "vit_gate" in outputs and isinstance(outputs["vit_gate"], torch.Tensor):
+            debug_stats.update(self._tensor_gate_stats(outputs["vit_gate"], prefix="vit_gate"))
+
+        if "matched_gate" in outputs and isinstance(outputs["matched_gate"], torch.Tensor):
+            debug_stats.update(self._tensor_gate_stats(outputs["matched_gate"], prefix="matched_gate"))
+
+        if "logits" in outputs and isinstance(outputs["logits"], torch.Tensor):
+            logits = outputs["logits"].detach().float()
+            debug_stats["logits_mean"] = logits.mean().item()
+            debug_stats["logits_std"] = logits.std().item()
+
+        return debug_stats
+
+    def _maybe_log_debug(
+        self,
+        outputs: dict[str, torch.Tensor],
+        epoch_index: int,
+        batch_index: int,
+        split: str,
+    ) -> None:
+        if self.experiment_logger is None:
+            return
+
+        if not self.log_debug_gates:
+            return
+
+        if self.debug_interval <= 0:
+            return
+
+        if (batch_index + 1) % self.debug_interval != 0:
+            return
+
+        debug_stats = self._extract_debug_stats(outputs)
+        if len(debug_stats) == 0:
+            return
+
+        self.experiment_logger.log_debug(
+            epoch=epoch_index,
+            step=batch_index + 1,
+            split=split,
+            debug_stats=debug_stats,
+        )
+
     def train_one_epoch(
         self,
         dataloader: DataLoader,
@@ -75,6 +159,8 @@ class Trainer:
         progress_bar = tqdm(
             dataloader,
             desc=f"[Train] Epoch {epoch_index}",
+            ascii=True,
+            dynamic_ncols=True,
             leave=False,
         )
 
@@ -102,6 +188,13 @@ class Trainer:
             else:
                 loss.backward()
                 self.optimizer.step()
+
+            self._maybe_log_debug(
+                outputs=outputs,
+                epoch_index=epoch_index,
+                batch_index=batch_index,
+                split="train",
+            )
 
             batch_size = labels.size(0)
             preds = torch.argmax(logits, dim=1)
@@ -148,6 +241,8 @@ class Trainer:
         progress_bar = tqdm(
             dataloader,
             desc=f"[{split_name}]",
+            ascii=True,
+            dynamic_ncols=True,
             leave=False,
         )
 
@@ -165,6 +260,13 @@ class Trainer:
                 outputs = self.model(images)
                 logits = outputs["logits"]
                 loss = self.criterion(logits, labels)
+
+            self._maybe_log_debug(
+                outputs=outputs,
+                epoch_index=0,
+                batch_index=batch_index,
+                split=split_name.lower(),
+            )
 
             batch_size = labels.size(0)
             preds = torch.argmax(logits, dim=1)
@@ -233,15 +335,15 @@ class Trainer:
             "val_acc": [],
         }
 
-        print("=" * 80)
-        print("Start training / 开始训练")
-        print(f"Device             : {self.device}")
-        print(f"Use AMP            : {self.use_amp}")
-        print(f"Num epochs         : {num_epochs}")
-        print(f"Max train batches  : {max_train_batches}")
-        print(f"Max val batches    : {max_val_batches}")
-        print(f"Save dir           : {self.save_dir}")
-        print("=" * 80)
+        self._log_info("=" * 80)
+        self._log_info("Start training")
+        self._log_info(f"Device             : {self.device}")
+        self._log_info(f"Use AMP            : {self.use_amp}")
+        self._log_info(f"Num epochs         : {num_epochs}")
+        self._log_info(f"Max train batches  : {max_train_batches}")
+        self._log_info(f"Max val batches    : {max_val_batches}")
+        self._log_info(f"Save dir           : {self.save_dir}")
+        self._log_info("=" * 80)
 
         for epoch_index in range(1, num_epochs + 1):
             train_metrics = self.train_one_epoch(
@@ -267,7 +369,16 @@ class Trainer:
             history["val_loss"].append(val_metrics["loss"])
             history["val_acc"].append(val_metrics["acc"])
 
-            print(
+            if self.experiment_logger is not None:
+                self.experiment_logger.log_epoch_metrics(
+                    epoch=epoch_index,
+                    train_loss=train_metrics["loss"],
+                    train_acc=train_metrics["acc"],
+                    val_loss=val_metrics["loss"],
+                    val_acc=val_metrics["acc"],
+                )
+
+            self._log_info(
                 f"Epoch [{epoch_index}/{num_epochs}] | "
                 f"train_loss={train_metrics['loss']:.4f}, "
                 f"train_acc={train_metrics['acc']:.4f}, "
@@ -282,9 +393,6 @@ class Trainer:
                     val_metrics=val_metrics,
                     filename="best_model.pt",
                 )
-                print(
-                    f"New best model saved / 保存新的最佳模型: "
-                    f"val_acc={self.best_val_acc:.4f}"
-                )
+                self._log_info(f"New best model saved: val_acc={self.best_val_acc:.4f}")
 
         return history

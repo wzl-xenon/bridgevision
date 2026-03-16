@@ -1,5 +1,3 @@
-# src/models/fusions/gated_fusion.py
-
 from __future__ import annotations
 
 import torch
@@ -7,34 +5,8 @@ import torch.nn as nn
 
 
 class GatedFusion(nn.Module):
-    """
-    Gated fusion / 门控融合模块
-
-    功能 / Features:
-    1. 输入两个全局特征向量
-       Take two global feature vectors as input
-    2. 根据二者拼接后的信息生成门控系数
-       Generate gate values from concatenated features
-    3. 用门控系数对两路特征进行加权融合
-       Fuse two branches with gate-weighted combination
-
-    输入 / Input:
-        feature_a: [B, D]
-        feature_b: [B, D]
-
-    输出 / Output:
-        fused_feature: [B, D]
-
-    数学形式 / Formula:
-        gate = sigmoid(MLP([a; b]))
-        fused = gate * a + (1 - gate) * b
-
-    设计思路 / Design idea:
-    - concat fusion 更像“先拼起来再学”
-      Concat fusion is more like "concatenate first, then learn"
-    - gated fusion 更像“让模型决定当前样本更信哪一路”
-      Gated fusion lets the model decide which branch to trust more for each sample
-    """
+    """用逐维门控融合两个全局特征 / Fuse two global features with a learned
+    per-dimension gate."""
 
     def __init__(
         self,
@@ -52,9 +24,7 @@ class GatedFusion(nn.Module):
         self.use_layernorm = use_layernorm
         self.refine_output = refine_output
 
-        gate_layers = [
-            nn.Linear(feature_dim * 2, self.hidden_dim),
-        ]
+        gate_layers = [nn.Linear(feature_dim * 2, self.hidden_dim)]
         if use_layernorm:
             gate_layers.append(nn.LayerNorm(self.hidden_dim))
         gate_layers.extend(
@@ -68,17 +38,10 @@ class GatedFusion(nn.Module):
         self.gate_network = nn.Sequential(*gate_layers)
 
         if refine_output:
-            refine_layers = [
-                nn.Linear(feature_dim, feature_dim),
-            ]
+            refine_layers = [nn.Linear(feature_dim, feature_dim)]
             if use_layernorm:
                 refine_layers.append(nn.LayerNorm(feature_dim))
-            refine_layers.extend(
-                [
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                ]
-            )
+            refine_layers.extend([nn.GELU(), nn.Dropout(dropout)])
             self.refine = nn.Sequential(*refine_layers)
         else:
             self.refine = nn.Identity()
@@ -89,21 +52,8 @@ class GatedFusion(nn.Module):
         feature_b: torch.Tensor,
         return_gate: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """
-        前向传播 / Forward pass
-
-        Args:
-            feature_a: [B, D]
-            feature_b: [B, D]
-            return_gate:
-                是否返回门控值
-                Whether to return gate values
-
-        Returns:
-            fused_feature: [B, D]
-            or
-            (fused_feature, gate): ([B, D], [B, D])
-        """
+        """融合两个 [B, D] 张量，并可选返回门控 / Fuse two tensors shaped
+        [B, D] and optionally return the gate."""
         if feature_a.dim() != 2 or feature_b.dim() != 2:
             raise ValueError("GatedFusion only supports 2D tensors of shape [B, D].")
 
@@ -119,8 +69,8 @@ class GatedFusion(nn.Module):
                 f"but got {feature_a.shape[-1]}"
             )
 
-        gate_input = torch.cat([feature_a, feature_b], dim=-1)  # [B, 2D]
-        gate = self.gate_network(gate_input)                     # [B, D], in [0, 1]
+        gate_input = torch.cat([feature_a, feature_b], dim=-1)
+        gate = self.gate_network(gate_input)
 
         fused_feature = gate * feature_a + (1.0 - gate) * feature_b
         fused_feature = self.refine(fused_feature)
@@ -130,10 +80,82 @@ class GatedFusion(nn.Module):
         return fused_feature
 
 
+class TokenDimGatedFusion(nn.Module):
+    """对齐后的 token 序列逐 token、逐维门控融合 / Fuse aligned token
+    sequences shaped [B, N, D] with a [B, N, D] gate."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        hidden_dim: int | None = None,
+        dropout: float = 0.1,
+        use_layernorm: bool = True,
+        refine_output: bool = True,
+    ) -> None:
+        super().__init__()
+
+        self.feature_dim = feature_dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else feature_dim
+        self.dropout = dropout
+        self.use_layernorm = use_layernorm
+        self.refine_output = refine_output
+
+        gate_layers = [nn.Linear(feature_dim * 2, self.hidden_dim)]
+        if use_layernorm:
+            gate_layers.append(nn.LayerNorm(self.hidden_dim))
+        gate_layers.extend(
+            [
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.hidden_dim, feature_dim),
+                nn.Sigmoid(),
+            ]
+        )
+        self.gate_network = nn.Sequential(*gate_layers)
+
+        if refine_output:
+            refine_layers = [nn.Linear(feature_dim, feature_dim)]
+            if use_layernorm:
+                refine_layers.append(nn.LayerNorm(feature_dim))
+            refine_layers.extend([nn.GELU(), nn.Dropout(dropout)])
+            self.refine = nn.Sequential(*refine_layers)
+        else:
+            self.refine = nn.Identity()
+
+    def forward(
+        self,
+        token_a: torch.Tensor,
+        token_b: torch.Tensor,
+        return_gate: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """融合两个 [B, N, D] 张量，并可选返回门控 / Fuse two tensors shaped
+        [B, N, D] and optionally return the gate."""
+        if token_a.dim() != 3 or token_b.dim() != 3:
+            raise ValueError("TokenDimGatedFusion only supports 3D tensors of shape [B, N, D].")
+
+        if token_a.shape != token_b.shape:
+            raise ValueError(
+                f"Shape mismatch: token_a.shape={token_a.shape}, token_b.shape={token_b.shape}"
+            )
+
+        if token_a.shape[-1] != self.feature_dim:
+            raise ValueError(
+                f"Feature dim mismatch: expected {self.feature_dim}, "
+                f"but got {token_a.shape[-1]}"
+            )
+
+        gate_input = torch.cat([token_a, token_b], dim=-1)
+        gate = self.gate_network(gate_input)
+
+        fused_tokens = gate * token_a + (1.0 - gate) * token_b
+        fused_tokens = self.refine(fused_tokens)
+
+        if return_gate:
+            return fused_tokens, gate
+        return fused_tokens
+
+
 def _demo_forward() -> None:
-    """
-    简单前向传播测试 / Simple forward test
-    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     feature_a = torch.randn(2, 512).to(device)

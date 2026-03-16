@@ -14,15 +14,8 @@ from src.models.dual_encoder_model import DualEncoderModel
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """
-    构建命令行参数 / Build command-line arguments
-    """
     parser = argparse.ArgumentParser(description="Evaluate BridgeVision model")
 
-    # ---------------------------
-    # Data / 数据相关
-    # 这些参数在 checkpoint 没存对应信息时作为 fallback
-    # ---------------------------
     parser.add_argument(
         "--dataset_name",
         type=str,
@@ -45,10 +38,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--pet_train_ratio", type=float, default=0.9)
 
-    # ---------------------------
-    # Model / 模型相关
-    # 这些参数在 checkpoint 没存对应信息时作为 fallback
-    # ---------------------------
     parser.add_argument("--model_mode", type=str, default="dual", choices=["dual", "resnet_only", "vit_only"])
     parser.add_argument("--num_classes", type=int, default=None)
     parser.add_argument("--resnet_name", type=str, default="resnet50")
@@ -65,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--fusion_type",
         type=str,
         default="concat",
-        choices=["concat", "gated", "token_bridge"],
+        choices=["concat", "gated", "token_bridge", "matched_token_gated"],
     )
     parser.add_argument("--fusion_dim", type=int, default=512)
     parser.add_argument("--projector_hidden_dim", type=int, default=1024)
@@ -77,14 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable_token_gate", action="store_false", dest="token_use_gate")
     parser.set_defaults(token_use_gate=True)
     parser.add_argument("--num_bridge_layers", type=int, default=1)
+    parser.add_argument("--matched_token_count", type=int, default=16)
     parser.add_argument("--summary_fusion_type", type=str, default="gated", choices=["concat", "gated"])
     parser.add_argument("--disable_cnn_pos_embed", action="store_false", dest="use_cnn_pos_embed")
     parser.set_defaults(use_cnn_pos_embed=True)
     parser.add_argument("--cnn_pos_embed_base_size", type=int, default=7)
 
-    # ---------------------------
-    # Eval / 评估相关
-    # ---------------------------
     parser.add_argument(
         "--split",
         type=str,
@@ -95,14 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_amp", action="store_true")
     parser.add_argument("--max_eval_batches", type=int, default=None)
 
-    # ---------------------------
-    # Cache / 缓存相关
-    # ---------------------------
     parser.add_argument("--torch_home", type=str, default="./pretrained/torch_home")
 
-    # ---------------------------
-    # Checkpoint / 权重相关
-    # ---------------------------
     parser.add_argument(
         "--checkpoint_path",
         type=str,
@@ -154,6 +135,7 @@ def build_model_config_from_args(args: argparse.Namespace, num_classes: int) -> 
         "token_ffn_hidden_dim": args.token_ffn_hidden_dim,
         "token_use_gate": args.token_use_gate,
         "num_bridge_layers": args.num_bridge_layers,
+        "matched_token_count": args.matched_token_count,
         "summary_fusion_type": args.summary_fusion_type,
         "use_cnn_pos_embed": args.use_cnn_pos_embed,
         "cnn_pos_embed_base_size": args.cnn_pos_embed_base_size,
@@ -176,18 +158,16 @@ def resolve_model_config(
                 f"Checkpoint num_classes={ckpt_num_classes} does not match dataset num_classes={num_classes}."
             )
 
-        # 兼容旧 checkpoint / Backward compatibility for older checkpoints
         model_config.setdefault("token_num_heads", 8)
         model_config.setdefault("token_gate_hidden_dim", None)
         model_config.setdefault("token_ffn_hidden_dim", None)
         model_config.setdefault("token_use_gate", True)
         model_config.setdefault("num_bridge_layers", 1)
+        model_config.setdefault("matched_token_count", 16)
         model_config.setdefault("summary_fusion_type", "gated")
         model_config.setdefault("use_cnn_pos_embed", True)
         model_config.setdefault("cnn_pos_embed_base_size", 7)
 
-        # eval 只需要结构匹配，不需要再触发预训练权重下载
-        # Evaluation only needs structural match; pretrained download is unnecessary
         model_config["pretrained_backbones"] = False
         model_config["freeze_backbones"] = False
         model_config["num_classes"] = num_classes
@@ -199,9 +179,6 @@ def resolve_model_config(
 
 
 def main() -> None:
-    """
-    主评估入口 / Main evaluation entry
-    """
     parser = build_parser()
     args = parser.parse_args()
 
@@ -211,18 +188,11 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ---------------------------
-    # 1. Load checkpoint file first
-    # ---------------------------
     checkpoint = load_checkpoint_file(
         checkpoint_path=args.checkpoint_path,
         device=device,
     )
 
-    # ---------------------------
-    # 2. Resolve data config
-    # 优先使用 checkpoint 中保存的数据配置
-    # ---------------------------
     resolved_data_config = resolve_data_config(args, checkpoint)
 
     datamodule = VisionDataModule(
@@ -236,6 +206,9 @@ def main() -> None:
         use_imagenet_norm=True,
         split_seed=resolved_data_config["split_seed"],
         pet_train_ratio=resolved_data_config["pet_train_ratio"],
+        food101_train_ratio=resolved_data_config["food101_train_ratio"],
+        dtd_partition=resolved_data_config["dtd_partition"],
+        aircraft_annotation_level=resolved_data_config["aircraft_annotation_level"],
     )
     datamodule.setup()
 
@@ -250,9 +223,6 @@ def main() -> None:
 
     num_classes = args.num_classes if args.num_classes is not None else datamodule.num_classes
 
-    # ---------------------------
-    # 3. Resolve model config
-    # ---------------------------
     model_config, config_source = resolve_model_config(
         args=args,
         checkpoint=checkpoint,
@@ -262,8 +232,11 @@ def main() -> None:
     model = DualEncoderModel(**model_config)
     model.load_state_dict(checkpoint["model_state_dict"])
 
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
     print("=" * 80)
-    print("Checkpoint loaded / 已加载 checkpoint")
+    print("Checkpoint loaded")
     print(f"Checkpoint path      : {args.checkpoint_path}")
     print(f"Config source        : {config_source}")
     print(f"Dataset              : {resolved_data_config['dataset_name']}")
@@ -272,13 +245,19 @@ def main() -> None:
     print(f"Pet train ratio      : {resolved_data_config['pet_train_ratio']}")
     print(f"Model mode           : {model_config['model_mode']}")
     print(f"Fusion type          : {model_config['fusion_type']}")
+    if model_config["fusion_type"] in {"token_bridge", "matched_token_gated"}:
+        print(f"Token heads          : {model_config['token_num_heads']}")
+        print(f"Bridge layers        : {model_config['num_bridge_layers']}")
+    if model_config["fusion_type"] == "matched_token_gated":
+        print(f"Matched token count  : {model_config['matched_token_count']}")
+    if model_config["fusion_type"] == "token_bridge":
+        print(f"Summary fusion       : {model_config['summary_fusion_type']}")
+    print(f"Total params         : {total_params:,}")
+    print(f"Trainable params     : {trainable_params:,}")
     print(f"Saved epoch          : {checkpoint.get('epoch', 'N/A')}")
     print(f"Saved best_val_acc   : {checkpoint.get('best_val_acc', 'N/A')}")
     print("=" * 80)
 
-    # ---------------------------
-    # 4. Build trainer / 复用 evaluate
-    # ---------------------------
     dummy_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
     trainer = Trainer(
@@ -291,9 +270,6 @@ def main() -> None:
         save_dir="./outputs/checkpoints/eval_tmp",
     )
 
-    # ---------------------------
-    # 5. Evaluate / 评估
-    # ---------------------------
     metrics = trainer.evaluate(
         dataloader=eval_loader,
         split_name=split_name,
@@ -301,7 +277,7 @@ def main() -> None:
     )
 
     print("=" * 80)
-    print(f"{split_name} evaluation finished / {split_name} 评估完成")
+    print(f"{split_name} evaluation finished")
     print(f"{split_name} loss : {metrics['loss']:.4f}")
     print(f"{split_name} acc  : {metrics['acc']:.4f}")
     print("=" * 80)
